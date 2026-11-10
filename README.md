@@ -60,3 +60,10 @@ Mô hình vẫn dùng thân xe hình hộp và động học đơn giản, chưa
 - `tests/browser-smoke.mjs`: WebGL, tín hiệu, bảng trạng thái, các thiết lập giao thông, lưu/hoàn tác và mobile.
 
 Không cần API key hay backend. Cần trình duyệt hỗ trợ WebGL2. Font web có font hệ thống dự phòng khi không có mạng.
+
+Tua thời gian: thanh phía trên nút chạy lưu tối đa 5 phút mô phỏng gần nhất,
+ở các mốc cách nhau 0,5 giây. Kéo thanh hoặc bấm “↶ 5s” để tạm dừng
+và xem lại; “Mới nhất” trở về mốc cuối đã lưu. Bấm ▶ hoặc Space để chạy
+tiếp từ thời điểm đang xem, thay thế phần lịch sử phía sau. Thay đổi đường sá
+bắt đầu lại lịch sử; lịch sử chỉ tồn tại trong phiên đang mở. Khi không thay đổi thiết lập giao thông, chạy tiếp sau khi tua lại tái hiện
+đúng chuỗi sinh xe và quyết định di chuyển trước đó.

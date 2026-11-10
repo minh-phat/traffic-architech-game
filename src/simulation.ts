@@ -360,8 +360,30 @@ export function annotateMovements(route:Route,world:World){
 export class Simulation {
   vehicles:Vehicle[]=[];time=0;completed=0;nextId=1;target=50;spawnClock=0;paused=false;types:Record<VehicleKind,boolean>={bike:true,car:true,truck:true};
   private driving=new DrivingSystem();
-  constructor(public world:World,public random:()=>number=Math.random){}
-  reset(){this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.driving=new DrivingSystem();}
+  // Keep consumed random values so restoring a checkpoint also restores the
+  // random stream, including custom random sources supplied by tests/callers.
+  private randomValues:number[]=[];
+  private randomCursor=0;
+  readonly random:()=>number;
+  constructor(public world:World,random:()=>number=Math.random){
+    this.random=()=>{
+      if(this.randomCursor===this.randomValues.length)this.randomValues.push(random());
+      return this.randomValues[this.randomCursor++];
+    };
+  }
+  reset(){this.randomValues=[];this.randomCursor=0;this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.driving=new DrivingSystem();}
+  snapshot(){
+    return {randomCursor:this.randomCursor,time:this.time,completed:this.completed,nextId:this.nextId,spawnClock:this.spawnClock,
+      target:this.target,types:{...this.types},driving:this.driving.snapshot(),
+      vehicles:this.vehicles.map(({route,...state})=>({...structuredClone(state),route}))};
+  }
+  restore(snapshot:ReturnType<Simulation['snapshot']>){
+    this.randomCursor=snapshot.randomCursor;
+    this.time=snapshot.time;this.completed=snapshot.completed;this.nextId=snapshot.nextId;
+    this.spawnClock=snapshot.spawnClock;this.target=snapshot.target;this.types={...snapshot.types};
+    this.vehicles=snapshot.vehicles.map(({route,...state})=>({...structuredClone(state),route}));
+    this.driving=new DrivingSystem();this.driving.restore(snapshot.driving);
+  }
   spawn(){
     const kinds=(Object.keys(this.types) as VehicleKind[]).filter(k=>this.types[k]);if(!kinds.length||this.world.houses.length<2)return;
     const from=this.world.houses[Math.floor(this.random()*this.world.houses.length)],to=this.world.houses[Math.floor(this.random()*this.world.houses.length)];if(from===to)return;

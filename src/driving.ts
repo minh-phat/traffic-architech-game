@@ -28,6 +28,16 @@ export class DrivingSystem {
   private surfaces=new Map<string,{a:Point;b:Point;road:Road}[]>();
   private surfaceReady=false;
 
+  snapshot(){
+    const {surfaces, surfaceReady, ...state}=this;
+    return structuredClone(state);
+  }
+
+  restore(state:ReturnType<DrivingSystem['snapshot']>){
+    Object.assign(this,structuredClone(state));
+    this.surfaces.clear();this.surfaceReady=false;
+  }
+
   roadDelay(sim:Simulation){
     const delay=new Map<number,number>();
     for(const v of sim.vehicles){if(!active(v))continue;const road=sim.world.nearest(v.pose)?.road;if(road)delay.set(road.id,(delay.get(road.id)??0)+(v.speed<1?8:1));}
