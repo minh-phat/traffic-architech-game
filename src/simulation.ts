@@ -132,8 +132,9 @@ export class World {
 type Edge={road:Road;reverse:boolean;start:string;end:string;length:number};
 type WayPoint=Point&{width:number};
 export type Pose=Point&{angle:number};
-export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number};
+export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean};
 export class Route {
+  fromHouse?:number;toHouse?:number;departureDoor?:Pose;departureLength=0;arrivalLength=0;
   turns:{start:number;end:number;direction:number}[]=[];
   points:WayPoint[]; lengths:number[]=[0]; total:number; signals:{s:number;light:Light;vertical:boolean}[]=[];
   constructor(raw:WayPoint[],lights:Light[]) {
@@ -272,7 +273,12 @@ export function planRoute(world:World,from:House,to:House):Route|null {
   // Driveways connect the actual house doorway to the road.
   const door=(h:House,side:number):WayPoint=>({...pt(h.x+Math.sin(h.angle)*4.2+Math.cos(h.angle)*side,h.z+Math.cos(h.angle)*4.2-Math.sin(h.angle)*side),width:3.6});
   const doorSide=world.drivingSide==='right'?-1:1;
-  return new Route([door(from,1.6*doorSide),...best.path,door(to,-1.6*doorSide)],world.lights);
+  const route=new Route([door(from,1.6*doorSide),...best.path,door(to,-1.6*doorSide)],world.lights);
+  route.fromHouse=from.id;route.toHouse=to.id;
+  route.departureDoor={...door(from,1.6*doorSide),angle:from.angle};
+  route.departureLength=dist(door(from,1.6*doorSide),best.path[0])+3;
+  route.arrivalLength=dist(door(to,-1.6*doorSide),best.path.at(-1)!)+6;
+  return route;
 }
 export function lightGreen(time:number,light:Light,vertical:boolean){const phase=(time+light.offset)%24;return vertical?phase>=13&&phase<23:phase>=1&&phase<11;}
 export class Simulation {
@@ -293,12 +299,18 @@ export class Simulation {
     if(this.spawnClock>.55&&this.vehicles.length<this.target){this.spawnClock=0;this.spawn();}
     // Spatial hash bounds local avoidance costs as traffic grows.
     const grid=new Map<string,Vehicle[]>();const cell=(p:Pose)=>`${Math.floor(p.x/12)},${Math.floor(p.z/12)}`;
-    const insert=(v:Vehicle)=>{const k=cell(v.pose);if(!grid.has(k))grid.set(k,[]);grid.get(k)!.push(v);};this.vehicles.forEach(insert);
+    const insert=(v:Vehicle)=>{const k=cell(v.pose);if(!grid.has(k))grid.set(k,[]);grid.get(k)!.push(v);};this.vehicles.filter(v=>!v.inGarage).forEach(insert);
     const order=[...this.vehicles].sort((a,b)=>b.waiting-a.waiting||a.id-b.id);
     for(const v of order){
+      // Keep a departing vehicle inside its garage until the arrival is complete.
+      if(v.inGarage){
+        if(this.vehicles.some(o=>o.id===v.garageYield&&!o.arrived))continue;
+        if(this.vehicles.some(o=>o!==v&&!o.inGarage&&overlaps(v.route.at(0),v.kind,o.pose,o.kind,.45)))continue;
+        v.inGarage=false;v.garageYield=undefined;v.pose=v.route.at(0);insert(v);
+      }
       v.age+=dt;v.decision-=dt;const spec=SPECS[v.kind],x=Math.floor(v.pose.x/12),z=Math.floor(v.pose.z/12),near:Vehicle[]=[];
       for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++)near.push(...(grid.get(`${x+dx},${z+dz}`)??[]));
-      const safe=(p:Pose,margin=.16)=>!near.some(o=>o!==v&&!o.arrived&&overlaps(p,v.kind,o.pose,o.kind,margin));
+      const safe=(p:Pose,margin=.16)=>!near.some(o=>o!==v&&!o.arrived&&!o.inGarage&&overlaps(p,v.kind,o.pose,o.kind,margin));
       const bound=Math.max(0,(v.route.at(v.s).width-spec.width)/2-.28);
       const turn=v.route.upcomingTurn(v.s);
       if(v.decision<=0){
@@ -308,12 +320,28 @@ export class Simulation {
         for(const offset of candidates){let free=0;for(let d=.6;d<=12;d+=.8){if(!safe(v.route.at(v.s+d,offset),.12))break;free=d;}const score=free-Math.abs(offset-v.offset)*.25-Math.abs(offset-preferred)*(preparing?.4:.04);if(score>bestScore){bestScore=score;best=offset;}}
         v.targetOffset=clamp(best,-bound,bound);v.decision=.3+this.random()*.25;
       }
-      let desired=spec.speed;const look=spec.length/2+v.speed*.85+1;
+      if(v.route.fromHouse!==undefined&&!v.leftHouse){
+        // The rear-most corner must cross the doorway, not the end of the driveway.
+        // Remember this once crossed so a later traffic manoeuvre cannot recall it home.
+        const door=v.route.departureDoor??v.route.at(0);
+        const outward=(v.pose.x-door.x)*Math.sin(door.angle)+(v.pose.z-door.z)*Math.cos(door.angle);
+        const relative=v.pose.angle-door.angle;
+        const rearExtent=Math.abs(Math.cos(relative))*spec.length/2+Math.abs(Math.sin(relative))*spec.width/2;
+        if(!v.inGarage&&outward>rearExtent+.05)v.leftHouse=true;
+      }
+      if(v.route.fromHouse!==undefined&&!v.leftHouse){
+        const incoming=this.vehicles.find(o=>o!==v&&!o.arrived&&!o.inGarage&&o.route.toHouse===v.route.fromHouse
+          &&o.route.total-o.s<o.route.arrivalLength+spec.length
+          &&Array.from({length:17},(_,i)=>i/16).some(t=>Array.from({length:17},(_,i)=>i/16).some(u=>overlaps(v.route.at(v.route.departureLength*t,v.offset),v.kind,o.route.at(o.s+(o.route.total-o.s)*u,o.offset),o.kind,.5))));
+        if(incoming)v.garageYield=incoming.id;
+      }
+      if(v.garageYield!==undefined&&!this.vehicles.some(o=>o.id===v.garageYield&&!o.arrived))v.garageYield=undefined;
+      let desired=this.vehicles.some(o=>o.garageYield===v.id&&!o.inGarage&&!o.arrived)?0:spec.speed;const look=spec.length/2+v.speed*.85+1;
       for(let d=.3;d<=look;d+=.5){if(!safe(v.route.at(v.s+d,v.offset),.12)){desired=Math.min(desired,Math.sqrt(Math.max(0,d-.25)*4));break;}}
       // Yield only to another moving body on a conflicting short-term trajectory.
       // A vehicle elsewhere in the same junction never reserves the whole junction.
       for(const other of near){
-        if(other===v||other.arrived||other.speed<.3)continue;
+        if(other===v||other.arrived||other.inGarage||other.garageYield===v.id||other.speed<.3)continue;
         const otherTurn=other.route.upcomingTurn(other.s,12);
         // Through traffic has priority regardless of spawn order. Check the
         // entire upcoming bend so we wait before entering its conflict area.
@@ -343,11 +371,23 @@ export class Simulation {
       }
       for(const signal of v.route.signals){const gap=signal.s-v.s-spec.length/2;if(gap>=-.25&&gap<20&&!lightGreen(this.time,signal.light,signal.vertical))desired=Math.min(desired,Math.sqrt(Math.max(0,gap)*4));}
       v.speed+=clamp(desired-v.speed,-5*dt,2.3*dt);
-      const nextOffset=clamp(v.offset+clamp(v.targetOffset-v.offset,-.85*dt,.85*dt),-bound,bound);
+      // Up to 35 degrees of steering; lateral travel follows a curved heading
+      // rather than moving the body sideways at its original orientation.
+      const lateralRate=Math.max(.85,v.speed*Math.tan(35*Math.PI/180));
+      const nextOffset=clamp(v.offset+clamp(v.targetOffset-v.offset,-lateralRate*dt,lateralRate*dt),-bound,bound);
       let nextS=Math.min(v.route.total,v.s+v.speed*dt);let pose:Pose=v.route.at(nextS,nextOffset);
       // Every movement is swept in <= 10 cm increments, including lateral movement.
       const startOffset=v.offset;
-      const sweep=(s:number,offset:number)=>{const steps=Math.max(1,Math.ceil((Math.abs(s-v.s)+Math.abs(offset-startOffset))/.1));for(let i=1;i<=steps;i++)if(!safe(v.route.at(v.s+(s-v.s)*i/steps,startOffset+(offset-startOffset)*i/steps),.08))return false;return true;};
+      const motionPose=(s:number,offset:number,t=1):Pose=>{
+        const p=v.route.at(s,offset),advance=s-v.s;
+        const heading=p.angle+(Math.abs(advance)>.00001?clamp(Math.atan((offset-startOffset)/advance),-.61,.61):0);
+        const delta=Math.atan2(Math.sin(heading-v.pose.angle),Math.cos(heading-v.pose.angle));
+        const rotated={...p,angle:v.pose.angle+clamp(delta,-dt*1.8,dt*1.8)*t};
+        // Hold the steering angle when rotating a corner would touch another body.
+        const held={...p,angle:v.pose.angle};
+        return !safe(rotated,.08)&&safe(held,.08)?held:rotated;
+      };
+      const sweep=(s:number,offset:number)=>{const steps=Math.max(1,Math.ceil((Math.abs(s-v.s)+Math.abs(offset-startOffset))/.1));for(let i=1;i<=steps;i++)if(!safe(motionPose(v.s+(s-v.s)*i/steps,startOffset+(offset-startOffset)*i/steps,i/steps),.08))return false;return true;};
       const oldCell=cell(v.pose);let moved=sweep(nextS,nextOffset);
       if(moved){v.offset=nextOffset;}else if(sweep(nextS,v.offset)){pose=v.route.at(nextS,v.offset);moved=true;}else if(sweep(v.s,nextOffset)){nextS=v.s;pose=v.route.at(v.s,nextOffset);v.offset=nextOffset;v.speed=0;}else{nextS=v.s;pose=v.pose;v.speed=0;}
       // Either participant may need to reverse: ID priority must not trap a
@@ -359,8 +399,8 @@ export class Simulation {
         // A turning body may hit within the first millimetres yet be clear
         // at 30 cm. Match the near-field checks to the movement sweep.
         const blocker=near.find(o=>o!==v&&o.waiting>1
-          &&(Math.cos(o.pose.angle-v.pose.angle)<.999||this.yielding.has(o.id))
-          &&[.001,.01,.03,.1,.2,.3].some(d=>overlaps(v.route.at(v.s+d,v.offset),v.kind,o.pose,o.kind,.08)));
+          &&(v.waiting>4||Math.cos(o.pose.angle-v.pose.angle)<.999||this.yielding.has(o.id))
+          &&[.001,.01,.03,.1,.2,.3].some(d=>overlaps(motionPose(v.s+d,v.offset),v.kind,o.pose,o.kind,.08)));
         if(blocker){yielding={other:blocker.id,until:this.time+8,backTo:Math.max(0,v.s-4)};this.yielding.set(v.id,yielding);}
       }
       if(yielding&&v.s>yielding.backTo){
@@ -381,8 +421,30 @@ export class Simulation {
         }
         if(escape!==undefined){v.offset=escape;nextS=v.s;pose=v.route.at(v.s,escape);v.speed=0;}
       }
+      if(Math.abs(nextS-v.s)<.001&&v.waiting>4&&(desired<.1||!moved)&&v.garageYield===undefined
+        &&!v.route.signals.some(signal=>Math.abs(signal.s-v.s-spec.length/2)<1.5&&!lightGreen(this.time,signal.light,signal.vertical))){
+        let bestGain=0;
+        for(const direction of [-1,1])for(const lateral of [-1,0,1]){
+          const trialS=clamp(v.s+direction*dt*.9,0,v.route.total);
+          const trialOffset=clamp(startOffset+lateral*dt*.85,-bound,bound);
+          const candidate=motionPose(trialS,trialOffset);
+          const clearance=(p:Pose)=>near.filter(o=>o!==v&&!o.arrived&&!o.inGarage).reduce((sum,o)=>sum+1/Math.max(.1,dist(p,o.pose))**2,0);
+          const gain=clearance(v.pose)-clearance(candidate);
+          if(gain>bestGain&&sweep(trialS,trialOffset)){bestGain=gain;nextS=trialS;v.offset=trialOffset;pose=candidate;v.speed=0;}
+        }
+      }
+      if(v.garageYield!==undefined){
+        const back=Math.max(0,v.s-dt*1.5);
+        if(sweep(back,v.offset)){nextS=back;pose=motionPose(back,v.offset);v.speed=0;}
+        else{nextS=v.s;pose=motionPose(v.s,v.offset);v.speed=0;}
+        if(nextS<=.001){v.inGarage=true;v.offset=v.targetOffset=0;nextS=0;}
+      }
+      if(v.inGarage)pose={...v.route.at(0),y:-10};
+      else if(sweep(nextS,v.offset))pose=motionPose(nextS,v.offset);
+      else{nextS=v.s;v.offset=startOffset;pose=v.pose;v.speed=0;}
       const advance=nextS-v.s;v.blocked=advance<.003;v.waiting=v.blocked?v.waiting+dt:Math.max(0,v.waiting-dt*2);v.s=nextS;v.pose=pose;
-      if(oldCell!==cell(pose)){grid.set(oldCell,grid.get(oldCell)!.filter(o=>o!==v));insert(v);}
+      if(v.inGarage){grid.set(oldCell,(grid.get(oldCell)??[]).filter(o=>o!==v));}
+      else if(oldCell!==cell(pose)){grid.set(oldCell,grid.get(oldCell)!.filter(o=>o!==v));insert(v);}
       if(v.s>=v.route.total-.1){v.arrived=true;this.completed++;this.yielding.delete(v.id);}
     }
     this.vehicles=this.vehicles.filter(v=>!v.arrived);

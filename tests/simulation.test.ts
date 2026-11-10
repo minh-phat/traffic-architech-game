@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { World, Simulation, Route, demoWorld, pt, overlaps, planRoute, SPECS, sampled, dist, type Vehicle, type VehicleKind } from '../src/simulation';
 
 function seeded(seed=42){return ()=>{seed=(1664525*seed+1013904223)>>>0;return seed/4294967296;};}
-function assertNoOverlap(sim:Simulation){for(let i=0;i<sim.vehicles.length;i++)for(let j=i+1;j<sim.vehicles.length;j++){const a=sim.vehicles[i],b=sim.vehicles[j];assert.equal(overlaps(a.pose,a.kind,b.pose,b.kind,0),false,`Vehicles ${a.id}/${b.id} intersect at t=${sim.time.toFixed(2)}`);}}
+function assertNoOverlap(sim:Simulation){for(let i=0;i<sim.vehicles.length;i++)for(let j=i+1;j<sim.vehicles.length;j++){const a=sim.vehicles[i],b=sim.vehicles[j];if(a.inGarage||b.inGarage)continue;assert.equal(overlaps(a.pose,a.kind,b.pose,b.kind,0),false,`Vehicles ${a.id}/${b.id} intersect at t=${sim.time.toFixed(2)}`);}}
 function vehicle(id:number,route:Route,s=0,kind:VehicleKind='car'):Vehicle{return {id,kind,route,s,offset:0,targetOffset:0,speed:6,pose:route.at(s),waiting:0,age:0,arrived:false,blocked:false,decision:0};}
 function house(id:number,x:number,z:number,angle=0){return {id,x,z,angle,kind:0};}
 
@@ -236,5 +236,52 @@ test('turning traffic yields to a conflicting straight vehicle regardless of ID'
     assert.ok(through.speed>=6,'Through traffic keeps priority');
     for(let i=0;i<1200;i++){sim.step();assertNoOverlap(sim);}
     assert.equal(sim.completed,2);
+  }
+});
+
+test('a departing vehicle reverses fully into its garage and waits for the arrival',()=>{
+  const outgoing=new Route([{...pt(0,0),width:3.6},{...pt(0,40),width:3.6}],[]);
+  const incoming=new Route([{...pt(0,40),width:3.6},{...pt(0,0),width:3.6}],[]);
+  outgoing.fromHouse=1;outgoing.departureLength=12;
+  incoming.toHouse=1;incoming.arrivalLength=20;
+  const sim=new Simulation(new World(),seeded());sim.target=0;
+  const leaving=vehicle(1,outgoing,.8),arriving=vehicle(2,incoming,27);
+  leaving.speed=arriving.speed=0;sim.vehicles=[leaving,arriving];
+  let parked=false;
+  for(let i=0;i<2400;i++){
+    sim.step();assertNoOverlap(sim);
+    if(leaving.inGarage){parked=true;assert.equal(leaving.s,0);}
+    if(parked&&!arriving.arrived)assert.equal(leaving.inGarage,true);
+  }
+  assert.ok(parked,'Departing driver must retreat into garage');
+  assert.equal(sim.completed,2);
+});
+
+test('lateral manoeuvres rotate the body with bounded angular speed',()=>{
+  const route=new Route([{...pt(0,0),width:8},{...pt(0,80),width:8}],[]);
+  const sim=new Simulation(new World(),seeded());sim.target=0;
+  const driver=vehicle(1,route,10);driver.targetOffset=2;driver.decision=99;sim.vehicles=[driver];
+  let turned=false;
+  for(let i=0;i<90;i++){
+    const previous=driver.pose.angle;sim.step();
+    assert.ok(Math.abs(driver.pose.angle-previous)<=1.8/60+.00001);
+    if(Math.abs(driver.pose.angle)>.1)turned=true;
+  }
+  assert.ok(turned);assert.ok(driver.offset>1.9);
+});
+
+
+test('only vehicles still straddling the doorway yield to a house arrival',()=>{
+  for(const kind of ['bike','car','truck'] as const)for(const cleared of [false,true]){
+    const outgoing=new Route([{...pt(0,0),width:5},{...pt(0,40),width:5}],[]);
+    const incoming=new Route([{...pt(0,40),width:5},{...pt(0,0),width:5}],[]);
+    outgoing.fromHouse=1;outgoing.departureLength=12;
+    incoming.toHouse=1;incoming.arrivalLength=20;
+    const sim=new Simulation(new World(),seeded());sim.target=0;
+    const leaving=vehicle(1,outgoing,SPECS[kind].length/2+(cleared?.2:-.2),kind);
+    const arriving=vehicle(2,incoming,27);leaving.speed=arriving.speed=0;
+    sim.vehicles=[leaving,arriving];sim.step();assertNoOverlap(sim);
+    assert.equal(leaving.garageYield,cleared?undefined:arriving.id);
+    assert.equal(!!leaving.leftHouse,cleared);
   }
 });

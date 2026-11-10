@@ -142,11 +142,11 @@ export class CityScene {
   update(sim:Simulation,alpha=1){
     const ids=new Set(sim.vehicles.map(v=>v.id));for(const [id,g]of this.carMeshes)if(!ids.has(id)){dispose(g);this.cars.remove(g);this.carMeshes.delete(id);}
     for(const v of sim.vehicles){const g=this.carMeshes.get(v.id)??this.makeVehicle(v);const old=g.userData.pose as Pose|undefined,p=v.pose;
-      const blend=old?alpha:1;g.position.lerp(new THREE.Vector3(p.x,p.y+.12,p.z),blend);let angle=p.angle-g.rotation.y;angle=Math.atan2(Math.sin(angle),Math.cos(angle));g.rotation.y+=angle*blend;g.userData.pose=p;g.getObjectByName('collision')!.visible=this.debug;
+      g.visible=!v.inGarage;const blend=old?alpha:1;g.position.lerp(new THREE.Vector3(p.x,p.y+.12,p.z),blend);let angle=p.angle-g.rotation.y;angle=Math.atan2(Math.sin(angle),Math.cos(angle));g.rotation.y+=angle*blend;g.userData.pose=p;g.getObjectByName('collision')!.visible=this.debug;
       const next=v.route.at(Math.min(v.route.total,v.s+.8)),prev=v.route.at(Math.max(0,v.s-.8));g.rotation.x=Math.atan2(next.y-prev.y,dist(prev,next)||1)*-.8;
     }
     for(const signal of this.signalMeshes){const light=sim.world.lights[signal.index];if(light){const green=lightGreen(sim.time,light,signal.vertical);const m=signal.mesh.material as THREE.MeshStandardMaterial;m.color.setHex(green?0x7cda8a:0xf26352);m.emissive.copy(m.color);}}
-    const selected=sim.vehicles.find(v=>v.id===this.selectedVehicleId);
+    const selected=sim.vehicles.find(v=>v.id===this.selectedVehicleId&&!v.inGarage);
     if(!selected)this.selectedVehicleId=null;
     this.selectionRing.visible=!!selected;
     if(selected){
@@ -155,7 +155,7 @@ export class CityScene {
       this.selectionRing.rotation.y=selected.pose.angle;
       this.selectionRing.scale.set(spec.width/2+.65,1,spec.length/2+.65);
     }
-    this.directions.update(selected?[selected]:sim.vehicles,!!selected||this.showDirections);
+    this.directions.update(selected?[selected]:sim.vehicles.filter(v=>!v.inGarage),!!selected||this.showDirections);
     this.controls.update();this.renderer.render(this.scene,this.camera);
   }
   preview(points:Point[],width:number,valid=true){dispose(this.ghost);if(points.length>1){const mesh=ribbon(points,width*2,valid?0x60b69a:0xe79c70,.2);mesh.material=new THREE.MeshStandardMaterial({color:valid?0x60b69a:0xe79c70,transparent:true,opacity:.65});mesh.material.userData.transient=true;this.ghost.add(mesh);}for(const p of [points[0],points.at(-1)])if(p){const m=cylinder(.75,.2,0xfff5d7,p.x,p.y+.3,p.z);this.ghost.add(m);}}
