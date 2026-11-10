@@ -47,6 +47,20 @@ try {
   await page.click('#camera-home');
   await page.check('#debug');await page.click('#day-night');await page.screenshot({path:'test-results/night.png'});await page.click('#day-night');
   await page.click('#tab-build');await page.click('[data-tool=curve]');assert.equal(await page.locator('#drawing-banner').isVisible(),true);await page.keyboard.press('Escape');
+  await page.click('#tab-traffic');
+  assert.equal(await page.locator('#driving-side').inputValue(),'right');
+  await page.selectOption('#driving-side','left');
+  let sideState=await page.evaluate(()=>window.__PHO_FLOW__.snapshot());
+  assert.equal(sideState.drivingSide,'left');assert.equal(sideState.vehicles,0);assert.equal(sideState.time,0);
+  await page.click('#save');
+  assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('pho-flow-city-v1')).drivingSide),'left');
+  await page.selectOption('#driving-side','right');await page.click('#undo');
+  assert.equal(await page.locator('#driving-side').inputValue(),'left');
+  assert.equal((await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).drivingSide,'left');
+  await page.selectOption('#driving-side','right');await page.click('#load');
+  assert.equal(await page.locator('#driving-side').inputValue(),'left');
+  await page.screenshot({path:'test-results/driving-side.png'});
+  await page.selectOption('#driving-side','right');await page.click('#tab-build');
   await page.click('#save');assert.ok(await page.evaluate(()=>localStorage.getItem('pho-flow-city-v1')));
   await page.click('#load');assert.equal((await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).houses,paused.houses);
   await page.click('#help');assert.equal(await page.locator('#help-dialog').isVisible(),true);await page.click('#start-building');
@@ -70,5 +84,5 @@ try {
   assert.ok((await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).roads>beforeRoads,'Roundabout tool must create circular roads');await page.click('#undo');
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:'test-results/mobile.png',fullPage:true});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'Mobile must not overflow horizontally');
-  assert.deepEqual(errors,[]);console.log('Browser smoke passed: WebGL, traffic, single-vehicle selection/switch/clear, direction display modes, pause, density, night mode, road/curve/bridge/roundabout/house placement, undo, save/load, help, mobile.');
+  assert.deepEqual(errors,[]);console.log('Browser smoke passed: WebGL, traffic, single-vehicle selection/switch/clear, direction display modes, pause, density, driving-side switch/reset/undo/save/load, night mode, road/curve/bridge/roundabout/house placement, undo, save/load, help, mobile.');
 } finally {await browser.close();}

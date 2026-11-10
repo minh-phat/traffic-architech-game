@@ -145,14 +145,68 @@ test('mixed traffic never overlaps during a deterministic 120-second city simula
 test('paused simulation leaves time and vehicle positions unchanged',()=>{const sim=new Simulation(demoWorld(),seeded());for(let i=0;i<180;i++)sim.step();const before=JSON.stringify(sim.vehicles);sim.paused=true;const time=sim.time;sim.step();assert.equal(sim.time,time);assert.equal(JSON.stringify(sim.vehicles),before);});
 
 test('moderate city traffic drains after spawning stops instead of locking at crossings',()=>{
-  for(const dt of [1/30,1/60])for(const seed of [1,7,42]){
-    const sim=new Simulation(demoWorld(),seeded(seed));sim.target=25;
+  for(const side of ['right','left'] as const)for(const dt of [1/30,1/60])for(const seed of [1,7,42]){
+    const world=demoWorld();world.setDrivingSide(side);
+    const sim=new Simulation(world,seeded(seed));sim.target=25;
     // Two minutes of arrivals, followed by four minutes to clear the network.
     for(let i=0;i<Math.round(360/dt);i++){
       if(i===Math.round(120/dt))sim.target=0;
       sim.step(dt);assertNoOverlap(sim);
     }
     assert.ok(sim.completed>25,`Seed ${seed}: insufficient completed trips`);
-    assert.equal(sim.vehicles.length,0,`Seed ${seed}, dt=${dt}: ${sim.vehicles.length} vehicles failed to clear`);
+    assert.equal(sim.vehicles.length,0,`Side ${side}, seed ${seed}, dt=${dt}: ${sim.vehicles.length} vehicles failed to clear`);
   }
+});
+
+test('right-hand traffic is the default and switching sides mirrors both travel directions',()=>{
+  const world=new World();world.addRoad([pt(-50,0),pt(50,0)]);
+  assert.equal(world.drivingSide,'right');
+  for(const side of ['right','left'] as const){
+    world.setDrivingSide(side);
+    for(const direction of [-1,1]){
+      const z=(side==='right'?1:-1)*direction*12;
+      const route=planRoute(world,house(1,-25*direction,z,z>0?Math.PI:0),house(2,25*direction,z,z>0?Math.PI:0))!;
+      let checked=0;
+      for(let s=0;s<route.total;s+=.5){const p=route.at(s);if(Math.abs(p.x)<15){
+        assert.ok(Math.abs(p.z-(side==='right'?1:-1)*direction*2.5)<.01);
+        assert.ok(Math.sin(p.angle)*direction>.99);checked++;
+      }}
+      assert.ok(checked>20);
+    }
+  }
+});
+test('driving side persists and old saves default to the right',()=>{
+  const world=demoWorld();world.setDrivingSide('left');
+  const copy=new World();copy.restore(world.serialize());
+  assert.equal(copy.drivingSide,'left');assert.equal(copy.serialize(),world.serialize());
+  const legacy=JSON.parse(world.serialize());delete legacy.drivingSide;
+  copy.restore(JSON.stringify(legacy));assert.equal(copy.drivingSide,'right');
+});
+test('switching driving side reverses roundabouts while retaining explicit one-way roads',()=>{
+  for(const side of ['right','left'] as const){
+    const world=new World();world.setDrivingSide(side);world.roundabout(pt(0,0));
+    const signedTurn=()=>world.roads.filter(r=>r.roundabout).reduce((sum,r)=>sum+r.points.slice(1).reduce((s,p,i)=>s+r.points[i].x*p.z-p.x*r.points[i].z,0),0);
+    assert.ok(signedTurn()*(side==='right'?-1:1)>0);
+    world.addRoad([pt(30,0),pt(60,0)],5,true);const road=world.roads.at(-1)!,before=JSON.stringify(road.points);
+    world.setDrivingSide(side==='right'?'left':'right');
+    assert.ok(signedTurn()*(side==='right'?1:-1)>0);
+    assert.equal(JSON.stringify(road.points),before);
+    assert.equal(planRoute(world,house(1,50,-12),house(2,40,-12)),null);
+  }
+});
+
+
+test('legacy roundabout saves adopt the default driving side and remain switchable',()=>{
+  const old=new World();old.setDrivingSide('left');old.roundabout(pt(5,-8));
+  old.addRoad([pt(30,0),pt(60,0)],5,true);
+  const saved=JSON.parse(old.serialize());delete saved.drivingSide;
+  for(const road of saved.roads)delete road.roundabout;
+  const loaded=new World();loaded.restore(JSON.stringify(saved));
+  assert.equal(loaded.drivingSide,'right');
+  const arcs=loaded.roads.filter(r=>r.roundabout);assert.equal(arcs.length,4);
+  for(const arc of arcs){const original=old.roads.find(r=>r.id===arc.id)!;assert.deepEqual(arc.points,[...original.points].reverse());}
+  const straight=loaded.roads.at(-1)!;assert.equal(straight.roundabout,undefined);
+  const before=JSON.stringify(straight.points);loaded.setDrivingSide('left');
+  assert.equal(JSON.stringify(straight.points),before);
+  for(const arc of arcs)assert.deepEqual(arc.points,old.roads.find(r=>r.id===arc.id)!.points);
 });
