@@ -232,9 +232,11 @@ test('turning traffic yields to a conflicting straight vehicle regardless of ID'
     const turning=vehicle(turningId,turn,turn.turns[0].start-10);
     const through=vehicle(3-turningId,straight,12);
     sim.vehicles=[turning,through];
-    sim.step();assert.ok(turning.speed<6,'Turner must brake for through traffic');
+    sim.step();assert.ok(turning.speed>=6,'A distant approach must not stop a clear turner early');
     assert.ok(through.speed>=6,'Through traffic keeps priority');
-    for(let i=0;i<1200;i++){sim.step();assertNoOverlap(sim);}
+    let yielded=false;
+    for(let i=0;i<1200;i++){sim.step();assertNoOverlap(sim);if(turning.state==='yielding'&&turning.blockerId===through.id)yielded=true;}
+    assert.ok(yielded,'Turner yields once the through vehicle is nearby in front');
     assert.equal(sim.completed,2);
   }
 });
@@ -279,9 +281,26 @@ test('only vehicles still straddling the doorway yield to a house arrival',()=>{
     incoming.toHouse=1;incoming.arrivalLength=20;
     const sim=new Simulation(new World(),seeded());sim.target=0;
     const leaving=vehicle(1,outgoing,SPECS[kind].length/2+(cleared?.2:-.2),kind);
-    const arriving=vehicle(2,incoming,27);leaving.speed=arriving.speed=0;
+    const arriving=vehicle(2,incoming,31);leaving.speed=arriving.speed=0;
     sim.vehicles=[leaving,arriving];sim.step();assertNoOverlap(sim);
     assert.equal(leaving.garageYield,cleared?undefined:arriving.id);
     assert.equal(!!leaving.leftHouse,cleared);
   }
+});
+
+test('a driver uses a clear side gap without reversing toward a following car',()=>{
+  const lane=new Route([{...pt(0,0),width:8},{...pt(0,100),width:8}],[]);
+  const parkedRoute=new Route([{...pt(0,0),width:8},{...pt(0,100),width:8}],[]);
+  parkedRoute.signals=[{s:28+SPECS.car.length/2,light:{x:0,z:28,offset:0},vertical:true}];
+  const sim=new Simulation(new World(),seeded());sim.target=0;sim.time=2;
+  const driver=vehicle(1,lane,20),parked=vehicle(2,parkedRoute,28),follower=vehicle(3,lane,15);
+  driver.speed=parked.speed=follower.speed=0;driver.waiting=8;
+  sim.vehicles=[driver,parked,follower];
+  let previous=driver.s;
+  for(let i=0;i<360;i++){
+    sim.step();assertNoOverlap(sim);
+    assert.ok(driver.s>=previous-.00001,'Driver must steer forward instead of reversing into its follower');
+    previous=driver.s;
+  }
+  assert.ok(driver.s>30,'Driver should pass the obstruction through the available side gap');
 });

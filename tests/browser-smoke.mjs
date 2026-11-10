@@ -33,6 +33,7 @@ try {
   await page.check('#show-directions');const firstSelected=await chooseVehicle();
   await page.waitForFunction(id=>{const s=window.__PHO_FLOW__.snapshot();return s.directionVehicleIds.length===1&&s.directionVehicleIds[0]===id;},firstSelected);
   assert.equal(await page.locator('#show-directions').isChecked(),false);assert.equal(await page.locator('#vehicle-inspector').isVisible(),true);
+  assert.match(await page.locator('#vehicle-details').textContent(),/km\/h.*m.*—/);
   await page.screenshot({path:'test-results/selected-vehicle.png'});
   const secondSelected=await chooseVehicle(firstSelected);assert.notEqual(secondSelected,firstSelected);
   await page.waitForFunction(id=>window.__PHO_FLOW__.snapshot().directionVehicleIds[0]===id,secondSelected);
@@ -82,7 +83,19 @@ try {
   assert.ok((await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).roads>beforeRoads,'Bridge tool must create a road');await page.click('#undo');
   await page.click('[data-tool=roundabout]');p=worldPixel(-100,-66);await page.mouse.click(p.x,p.y);
   assert.ok((await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).roads>beforeRoads,'Roundabout tool must create circular roads');await page.click('#undo');
+  // Configure the new driving controls through the UI and verify undo/save/load.
+  if(!(await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).paused)await page.click('#play-pause');
+  await page.click('#tab-traffic');await page.selectOption('#signal-plan','protected');
+  assert.equal(await page.evaluate(()=>window.__PHO_FLOW__.world.lights.every(light=>light.phases?.some(phase=>phase.turns==='left'))),true);
+  await page.screenshot({path:'test-results/protected-signals.png'});
+  await page.click('#undo');assert.equal(await page.locator('#signal-plan').inputValue(),'shared');
+  await page.click('#tab-build');await page.keyboard.press('Escape');
+  p=worldPixel(-65,0);await page.mouse.click(p.x,p.y);assert.equal(await page.locator('#selected-road').isVisible(),true);
+  await page.selectOption('#road-priority','1');await page.selectOption('#road-control','stop');await page.selectOption('#junction-mode','zipper');await page.click('#apply-width');
+  assert.equal(await page.evaluate(()=>window.__PHO_FLOW__.world.roads.some(road=>road.priority===1&&road.control==='stop'&&road.junctionMode==='zipper')),true);
+  await page.click('#save');await page.click('#load');
+  assert.equal(await page.evaluate(()=>window.__PHO_FLOW__.world.roads.some(road=>road.priority===1&&road.control==='stop'&&road.junctionMode==='zipper')),true);
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:'test-results/mobile.png',fullPage:true});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'Mobile must not overflow horizontally');
-  assert.deepEqual(errors,[]);console.log('Browser smoke passed: WebGL, traffic, single-vehicle selection/switch/clear, direction display modes, pause, density, driving-side switch/reset/undo/save/load, night mode, road/curve/bridge/roundabout/house placement, undo, save/load, help, mobile.');
+  assert.deepEqual(errors,[]);console.log('Browser smoke passed: WebGL, traffic, single-vehicle selection/switch/clear, direction display modes, pause, density, driving-side switch/reset/undo/save/load, night mode, protected signal phases, road priority/stop/zipper controls, road/curve/bridge/roundabout/house placement, undo, save/load, help, mobile.');
 } finally {await browser.close();}

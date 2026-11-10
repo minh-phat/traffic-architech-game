@@ -1,13 +1,16 @@
+import { DrivingSystem } from './driving';
 export type Point = { x: number; y: number; z: number };
 export type DrivingSide = 'right' | 'left';
-export type Road = { id: number; points: Point[]; width: number; oneWay: boolean; roundabout?: boolean };
+export type Road = { id: number; points: Point[]; width: number; oneWay: boolean; roundabout?: boolean; priority?: number; control?: 'none' | 'yield' | 'stop'; junctionMode?: 'priority' | 'zipper' | 'all-way-stop' };
 export type House = { id: number; x: number; z: number; kind: number; angle: number };
-export type Light = { x: number; z: number; offset: number };
+export type SignalColor = 'green' | 'yellow' | 'red';
+export type SignalPhase = { duration:number; horizontal:SignalColor; vertical:SignalColor; turns?: 'all' | 'straight' | 'left' | 'right' };
+export type Light = { x: number; z: number; offset: number; phases?:SignalPhase[] };
 export type VehicleKind = 'bike' | 'car' | 'truck';
 export const SPECS = {
-  bike: { width: .8, length: 2, speed: 9, color: 0xf7c557 },
-  car: { width: 1.8, length: 3.9, speed: 8, color: 0xe8efeb },
-  truck: { width: 2.3, length: 6.4, speed: 5.8, color: 0x52a99c },
+  bike: { width: .8, length: 2, speed: 9, accel:2.4, brake:3.5, emergencyBrake:7, wheelbase:1.35, maxSteer:.65, lateralAccel:2.2, headway:.85, color: 0xf7c557 },
+  car: { width: 1.8, length: 3.9, speed: 8, accel:1.8, brake:2.8, emergencyBrake:7, wheelbase:2.6, maxSteer:.65, lateralAccel:1.8, headway:1.25, color: 0xe8efeb },
+  truck: { width: 2.3, length: 6.4, speed: 5.8, accel:1.05, brake:2.1, emergencyBrake:5, wheelbase:3.7, maxSteer:.7, lateralAccel:1.25, headway:1.7, color: 0x52a99c },
 };
 export const pt = (x: number, z: number, y = 0): Point => ({ x, y, z });
 export const dist = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.z - b.z);
@@ -132,8 +135,11 @@ export class World {
 type Edge={road:Road;reverse:boolean;start:string;end:string;length:number};
 type WayPoint=Point&{width:number};
 export type Pose=Point&{angle:number};
-export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean};
+export type DrivingState = 'driving' | 'following' | 'red-light' | 'yielding' | 'exit-blocked' | 'stopping' | 'blocked' | 'reversing' | 'garage' | 'merging';
+export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean; state?:DrivingState; reason?:string; blockerId?:number; stuckTime?:number; velocity?:number; acceleration?:number; steering?:number; indicator?:-1|0|1; braking?:boolean; approachSince?:number; approachId?:string; stopTime?:number; stopSince?:number; driverFactor?:number; lane?:number; rerouteAt?:number; tripDistance?:number};
+export type Movement = { id:string; entry:number; exit:number; stop:number; center:Point; incoming:number; outgoing:number; incomingRoad?:number; turn:-1|0|1; priority:number; control:'none'|'yield'|'stop'; mode:'priority'|'zipper'|'all-way-stop'; circulating:boolean; enteringRoundabout:boolean; light?:Light };
 export class Route {
+  movements:Movement[]=[]; roadIds:number[]=[];
   fromHouse?:number;toHouse?:number;departureDoor?:Pose;departureLength=0;arrivalLength=0;
   turns:{start:number;end:number;direction:number}[]=[];
   points:WayPoint[]; lengths:number[]=[0]; total:number; signals:{s:number;light:Light;vertical:boolean}[]=[];
@@ -161,6 +167,18 @@ export class Route {
       if(nearest<9&&index>0&&elevation<1){const p=points[index],prev=points[index-1],s=this.lengths[index-1]+(this.lengths[index]-this.lengths[index-1])*fraction;this.signals.push({s:Math.max(0,s-8),light,vertical:Math.abs(p.z-prev.z)>Math.abs(p.x-prev.x)});}
     }
   }
+  locate(p:Point, around=0, radius=Infinity){
+    let best={s:around,offset:0,distance:Infinity};
+    let low=0,high=this.lengths.length-1;
+    while(low+1<high){const mid=(low+high)>>1;if(this.lengths[mid]<around-radius)low=mid;else high=mid;}
+    for(let i=Math.max(1,low);i<this.points.length&&this.lengths[i-1]<=around+radius;i++){
+      const q=project(p,this.points[i-1],this.points[i]);
+      if(q.distance<best.distance){const s=this.lengths[i-1]+(this.lengths[i]-this.lengths[i-1])*q.t,pose=this.at(s);best={s,offset:(p.x-pose.x)*Math.cos(pose.angle)-(p.z-pose.z)*Math.sin(pose.angle),distance:q.distance};}
+    }
+    return best;
+  }
+  curvature(s:number){const a=this.at(s-1).angle,b=this.at(s+1).angle;return Math.atan2(Math.sin(b-a),Math.cos(b-a))/2;}
+  movement(s:number,ahead=24){return this.movements.find(m=>m.exit>=s&&m.stop<=s+ahead);}
   upcomingTurn(s:number,ahead=16){return this.turns.find(t=>t.end>=s&&t.start<=s+ahead);}
   position(s:number):Point&{width:number} {
     s=clamp(s,0,this.total);let low=0,high=this.lengths.length-1;
@@ -228,7 +246,7 @@ function connectPaths(chunks:WayPoint[][]):WayPoint[]{
   }
   return cleanPoints(result);
 }
-export function planRoute(world:World,from:House,to:House):Route|null {
+export function planRoute(world:World,from:House,to:House,options:{kind?:VehicleKind;roadDelay?:Map<number,number>;startPose?:Pose}={}):Route|null {
   const a=world.nearest(pt(from.x,from.z)),b=world.nearest(pt(to.x,to.z));if(!a||!b)return null;
   const edges:Edge[]=world.roads.flatMap(road=>{const base={road,start:key(road.points[0]),end:key(road.points.at(-1)!),length:road.points.slice(1).reduce((s,p,i)=>s+dist(p,road.points[i]),0),reverse:false};return road.oneWay?[base]:[base,{...base,start:base.end,end:base.start,reverse:true}];});
   let best:{cost:number;path:WayPoint[]}|null=null;
@@ -236,6 +254,8 @@ export function planRoute(world:World,from:House,to:House):Route|null {
   const nearSide=(q:NonNullable<ReturnType<World['nearest']>>,h:House)=>{const p=q.road.points[q.index],n=q.road.points[q.index+1];const leftSide=(h.x-q.point.x)*(n.z-p.z)-(h.z-q.point.z)*(n.x-p.x)<0;return world.drivingSide==='left'?leftSide:!leftSide;};
   const sideA=a.road.oneWay?false:nearSide(a,from),sideB=b.road.oneWay?false:nearSide(b,to);
   for(const reverseA of a.road.oneWay?[false]:[sideA,!sideA])for(const reverseB of b.road.oneWay?[false]:[sideB,!sideB]) {
+    const tangent=Math.atan2(a.road.points[a.index+1].x-a.road.points[a.index].x,a.road.points[a.index+1].z-a.road.points[a.index].z)+(reverseA?Math.PI:0);
+    if(options.startPose&&Math.cos(tangent-options.startPose.angle)<.85)continue;
     const first=reverseA?[...a.road.points.slice(0,a.index+1),a.point]:[a.point,...a.road.points.slice(a.index+1)];
     const last=reverseB?[b.point,...b.road.points.slice(b.index+1)]:[...b.road.points.slice(0,b.index+1),b.point];
     const start=key(reverseA?a.road.points[0]:a.road.points.at(-1)!),end=key(reverseB?b.road.points.at(-1)!:b.road.points[0]);
@@ -253,7 +273,8 @@ export function planRoute(world:World,from:House,to:House):Route|null {
       visited.add(state);
       for(const e of edges){
         if(e.start!==incoming.node||(e.road===incoming.road&&e.reverse!==incoming.reverse))continue;
-        const next=edgeKey(e.road,e.reverse),cost=costs.get(state)!+e.length;
+        const next=edgeKey(e.road,e.reverse),cost=costs.get(state)!+e.length+(options.roadDelay?.get(e.road.id)??0);
+        if(options.kind&&e.road.width<SPECS[options.kind].width+.55)continue;
         if(!visited.has(next)&&cost<(costs.get(next)??Infinity)){
           costs.set(next,cost);states.set(next,{node:e.end,road:e.road,reverse:e.reverse});prev.set(next,{from:state,edge:e});pending.add(next);
         }
@@ -264,190 +285,101 @@ export function planRoute(world:World,from:House,to:House):Route|null {
     while(state!==initial){const step=prev.get(state)!;middle.unshift(step.edge);state=step.from;}
     const chunks=[directed(a.road,reverseA,world.drivingSide,first),...middle.map(e=>directed(e.road,e.reverse,world.drivingSide)),directed(b.road,reverseB,world.drivingSide,last)].filter(c=>c.length>1);
     const route=connectPaths(chunks);
-    const cost=route.slice(1).reduce((s,p,i)=>s+dist(p,route[i]),0)+(reverseA!==sideA?10:0)+(reverseB!==sideB?10:0);
+    const cost=route.slice(1).reduce((s,p,i)=>s+dist(p,route[i]),0)+(reverseA!==sideA?25:0)+(reverseB!==sideB?25:0)+(options.roadDelay?.get(a.road.id)??0)+(options.roadDelay?.get(b.road.id)??0)+middle.reduce((sum,e)=>sum+(options.roadDelay?.get(e.road.id)??0),0);
     if(!best||cost<best.cost)best={cost,path:route};
   }
   // Direct trips on the same road do not need to circle through an endpoint.
-  if(a.road===b.road){const reverse=a.index+a.t>b.index+b.t;if(!a.road.oneWay||!reverse){const lo=reverse?b:a,hi=reverse?a:b;const raw=[lo.point,...a.road.points.slice(lo.index+1,hi.index+1),hi.point];const path=directed(a.road,reverse,world.drivingSide,raw);const cost=path.slice(1).reduce((s,p,i)=>s+dist(p,path[i]),0)+(reverse!==sideA?10:0)+(reverse!==sideB?10:0);if(!best||cost<best.cost)best={cost,path};}}
+  if(a.road===b.road){const reverse=a.index+a.t>b.index+b.t;const tangent=Math.atan2(a.road.points[a.index+1].x-a.road.points[a.index].x,a.road.points[a.index+1].z-a.road.points[a.index].z)+(reverse?Math.PI:0);if((!a.road.oneWay||!reverse)&&(!options.startPose||Math.cos(tangent-options.startPose.angle)>.85)){const lo=reverse?b:a,hi=reverse?a:b;const raw=[lo.point,...a.road.points.slice(lo.index+1,hi.index+1),hi.point];const path=directed(a.road,reverse,world.drivingSide,raw);const cost=path.slice(1).reduce((s,p,i)=>s+dist(p,path[i]),0)+(reverse!==sideA?25:0)+(reverse!==sideB?25:0)+(options.roadDelay?.get(a.road.id)??0);if(!best||cost<best.cost)best={cost,path};}}
   if(!best||best.path.length<2)return null;
   // Driveways connect the actual house doorway to the road.
-  const door=(h:House,side:number):WayPoint=>({...pt(h.x+Math.sin(h.angle)*4.2+Math.cos(h.angle)*side,h.z+Math.cos(h.angle)*4.2-Math.sin(h.angle)*side),width:3.6});
+  const door=(h:House,side:number):WayPoint=>({...pt(h.x+Math.sin(h.angle)*4.2+Math.cos(h.angle)*side,h.z+Math.cos(h.angle)*4.2-Math.sin(h.angle)*side),width:6.4});
   const doorSide=world.drivingSide==='right'?-1:1;
-  const route=new Route([door(from,1.6*doorSide),...best.path,door(to,-1.6*doorSide)],world.lights);
-  route.fromHouse=from.id;route.toHouse=to.id;
-  route.departureDoor={...door(from,1.6*doorSide),angle:from.angle};
-  route.departureLength=dist(door(from,1.6*doorSide),best.path[0])+3;
+  const departure=options.startPose?{...options.startPose,width:a.road.width}:door(from,1.6*doorSide),arrival=door(to,-1.6*doorSide);
+  let raw:WayPoint[];
+  if(options.startPose){
+    const ahead={...departure,x:departure.x+Math.sin(options.startPose.angle)*2,z:departure.z+Math.cos(options.startPose.angle)*2};
+    const onward=trimPath(best.path,Math.min(4,pathLength(best.path)*.2),0);
+    raw=connectPaths([[departure,ahead],onward,[best.path.at(-1)!,arrival]].filter(c=>c.length>1&&pathLength(c)>.05));
+  }else raw=connectPaths([[departure,best.path[0]],best.path,[best.path.at(-1)!,arrival]]);
+  const route=new Route(raw,world.lights);
+  if(!options.startPose){route.fromHouse=from.id;route.departureDoor={...departure,angle:from.angle};route.departureLength=dist(departure,best.path[0])+3;}
+  route.toHouse=to.id;
   route.arrivalLength=dist(door(to,-1.6*doorSide),best.path.at(-1)!)+6;
+  annotateMovements(route,world);
+  if(options.kind&&route.points.some(p=>p.width<SPECS[options.kind!].width+.35))return null;
   return route;
 }
-export function lightGreen(time:number,light:Light,vertical:boolean){const phase=(time+light.offset)%24;return vertical?phase>=13&&phase<23:phase>=1&&phase<11;}
+export function protectedSignalPhases():SignalPhase[]{
+  const phases:SignalPhase[]=[];
+  for(const vertical of [false,true])for(const turns of ['straight','left','right'] as const){
+    phases.push({duration:turns==='straight'?7:4,horizontal:vertical?'red':'green',vertical:vertical?'green':'red',turns},
+      {duration:2,horizontal:vertical?'red':'yellow',vertical:vertical?'yellow':'red',turns},
+      {duration:1,horizontal:'red',vertical:'red'});
+  }
+  return phases;
+}
+export function signalState(time:number,light:Light,vertical:boolean,turn:'straight'|'left'|'right'='straight'):SignalColor {
+  const phases=light.phases??[
+    {duration:1,horizontal:'red',vertical:'red'}, {duration:7,horizontal:'green',vertical:'red'},
+    {duration:3,horizontal:'yellow',vertical:'red'}, {duration:2,horizontal:'red',vertical:'red'},
+    {duration:7,horizontal:'red',vertical:'green'}, {duration:3,horizontal:'red',vertical:'yellow'},
+    {duration:1,horizontal:'red',vertical:'red'},
+  ] satisfies SignalPhase[];
+  const total=phases.reduce((n,p)=>n+Math.max(0,p.duration),0);if(!total)return 'red';
+  let phase=((time+light.offset)%total+total)%total;
+  for(const p of phases){if(phase<p.duration)return p.turns&&p.turns!=='all'&&p.turns!==turn?'red':(vertical?p.vertical:p.horizontal);phase-=Math.max(0,p.duration);}
+  return 'red';
+}
+export function lightGreen(time:number,light:Light,vertical:boolean){return signalState(time,light,vertical)==='green';}
+
+/** Junction identity and approach priority come from road topology, never route curvature. */
+export function annotateMovements(route:Route,world:World){
+  route.movements=[];route.roadIds=[];
+  const nodes=new Map<string,{point:Point;roads:Road[]}>();
+  for(const road of world.roads){for(const point of [road.points[0],road.points.at(-1)!]){const k=key(point),node=nodes.get(k)??{point,roads:[]};node.roads.push(road);nodes.set(k,node);}}
+  for(const [id,node] of nodes){
+    if(node.roads.length<3)continue;
+    const q=route.locate(node.point);const radius=Math.max(...node.roads.map(r=>r.width))+1;
+    if(q.distance>radius||q.s<route.departureLength-2||q.s>route.total-route.arrivalLength+2)continue;
+    const entry=Math.max(0,q.s-radius),exit=Math.min(route.total,q.s+radius);
+    const before=route.at(Math.max(0,entry-2)),after=route.at(Math.min(route.total,exit+2));
+    const nearestRoad=(p:Point)=>node.roads.map(road=>({road,d:Math.min(...road.points.slice(1).map((b,i)=>project(p,road.points[i],b).distance))})).sort((a,b)=>a.d-b.d)[0].road;
+    const incoming=nearestRoad(before),outgoing=nearestRoad(after);
+    const delta=Math.atan2(Math.sin(after.angle-before.angle),Math.cos(after.angle-before.angle));
+    const turn=(Math.abs(delta)<.45?0:Math.sign(delta)) as -1|0|1;
+    route.movements.push({id,entry,exit,stop:entry,center:node.point,incoming:before.angle,outgoing:after.angle,incomingRoad:incoming.id,turn,
+      priority:incoming.priority??0,control:incoming.control??'none',mode:node.roads.some(r=>r.junctionMode==='all-way-stop')?'all-way-stop':node.roads.some(r=>r.junctionMode==='zipper')?'zipper':'priority',
+      circulating:!!incoming.roundabout,enteringRoundabout:!incoming.roundabout&&!!outgoing.roundabout,
+      light:node.point.y<1?world.lights.find(l=>dist(pt(l.x,l.z),node.point)<2):undefined});
+  }
+  route.movements.sort((a,b)=>a.entry-b.entry);
+  // Bind a light to its incoming approach and explicit stop line, not the bend tangent.
+  route.signals=route.movements.filter(m=>m.light).map(m=>({s:m.stop,light:m.light!,vertical:Math.abs(Math.cos(m.incoming))>Math.abs(Math.sin(m.incoming))}));
+  for(let s=route.departureLength;s<route.total-route.arrivalLength;s+=5){const road=world.nearest(route.at(s))?.road;if(road&&!route.roadIds.includes(road.id))route.roadIds.push(road.id);}
+}
 export class Simulation {
   vehicles:Vehicle[]=[];time=0;completed=0;nextId=1;target=50;spawnClock=0;paused=false;types:Record<VehicleKind,boolean>={bike:true,car:true,truck:true};
+  private driving=new DrivingSystem();
   constructor(public world:World,public random:()=>number=Math.random){}
-  private yielding=new Map<number,{other:number;until:number;backTo:number}>();
-  reset(){this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.yielding.clear();}
+  reset(){this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.driving=new DrivingSystem();}
   spawn(){
     const kinds=(Object.keys(this.types) as VehicleKind[]).filter(k=>this.types[k]);if(!kinds.length||this.world.houses.length<2)return;
     const from=this.world.houses[Math.floor(this.random()*this.world.houses.length)],to=this.world.houses[Math.floor(this.random()*this.world.houses.length)];if(from===to)return;
     const distribution=kinds.flatMap(k=>Array.from({length:k==='bike'?5:k==='car'?3:1},()=>k));
-    const kind=distribution[Math.floor(this.random()*distribution.length)],route=planRoute(this.world,from,to);if(!route||route.total<8||route.points.some(p=>p.width<SPECS[kind].width+.35))return;
-    const pose=route.at(0);if(this.vehicles.some(v=>overlaps(pose,kind,v.pose,v.kind,.45)))return;
-    this.vehicles.push({id:this.nextId++,kind,route,s:0,offset:0,targetOffset:0,speed:0,pose,waiting:0,age:0,arrived:false,blocked:false,decision:0});
+    const kind=distribution[Math.floor(this.random()*distribution.length)],route=planRoute(this.world,from,to,{kind,roadDelay:this.driving.roadDelay(this)});if(!route||route.total<8)return;
+    const pose=route.at(0);if(this.vehicles.some(v=>!v.inGarage&&overlaps(pose,kind,v.pose,v.kind,.45)))return;
+    this.vehicles.push({id:this.nextId++,kind,route,s:0,offset:0,targetOffset:0,speed:0,pose,waiting:0,age:0,arrived:false,blocked:false,decision:0,driverFactor:.92+this.random()*.16});
   }
   step(dt=1/60){
-    if(this.paused)return;this.time+=dt;this.spawnClock+=dt;
-    if(this.spawnClock>.55&&this.vehicles.length<this.target){this.spawnClock=0;this.spawn();}
-    // Spatial hash bounds local avoidance costs as traffic grows.
-    const grid=new Map<string,Vehicle[]>();const cell=(p:Pose)=>`${Math.floor(p.x/12)},${Math.floor(p.z/12)}`;
-    const insert=(v:Vehicle)=>{const k=cell(v.pose);if(!grid.has(k))grid.set(k,[]);grid.get(k)!.push(v);};this.vehicles.filter(v=>!v.inGarage).forEach(insert);
-    const order=[...this.vehicles].sort((a,b)=>b.waiting-a.waiting||a.id-b.id);
-    for(const v of order){
-      // Keep a departing vehicle inside its garage until the arrival is complete.
-      if(v.inGarage){
-        if(this.vehicles.some(o=>o.id===v.garageYield&&!o.arrived))continue;
-        if(this.vehicles.some(o=>o!==v&&!o.inGarage&&overlaps(v.route.at(0),v.kind,o.pose,o.kind,.45)))continue;
-        v.inGarage=false;v.garageYield=undefined;v.pose=v.route.at(0);insert(v);
-      }
-      v.age+=dt;v.decision-=dt;const spec=SPECS[v.kind],x=Math.floor(v.pose.x/12),z=Math.floor(v.pose.z/12),near:Vehicle[]=[];
-      for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++)near.push(...(grid.get(`${x+dx},${z+dz}`)??[]));
-      const safe=(p:Pose,margin=.16)=>!near.some(o=>o!==v&&!o.arrived&&!o.inGarage&&overlaps(p,v.kind,o.pose,o.kind,margin));
-      const bound=Math.max(0,(v.route.at(v.s).width-spec.width)/2-.28);
-      const turn=v.route.upcomingTurn(v.s);
-      if(v.decision<=0){
-        const preparing=turn&&v.waiting<2;
-        const preferred=preparing?turn.direction*bound*.8:0;
-        const candidates=[v.offset,0,-bound,bound,-bound*.5,bound*.5,preferred];let best=v.offset,bestScore=-Infinity;
-        for(const offset of candidates){let free=0;for(let d=.6;d<=12;d+=.8){if(!safe(v.route.at(v.s+d,offset),.12))break;free=d;}const score=free-Math.abs(offset-v.offset)*.25-Math.abs(offset-preferred)*(preparing?.4:.04);if(score>bestScore){bestScore=score;best=offset;}}
-        v.targetOffset=clamp(best,-bound,bound);v.decision=.3+this.random()*.25;
-      }
-      if(v.route.fromHouse!==undefined&&!v.leftHouse){
-        // The rear-most corner must cross the doorway, not the end of the driveway.
-        // Remember this once crossed so a later traffic manoeuvre cannot recall it home.
-        const door=v.route.departureDoor??v.route.at(0);
-        const outward=(v.pose.x-door.x)*Math.sin(door.angle)+(v.pose.z-door.z)*Math.cos(door.angle);
-        const relative=v.pose.angle-door.angle;
-        const rearExtent=Math.abs(Math.cos(relative))*spec.length/2+Math.abs(Math.sin(relative))*spec.width/2;
-        if(!v.inGarage&&outward>rearExtent+.05)v.leftHouse=true;
-      }
-      if(v.route.fromHouse!==undefined&&!v.leftHouse){
-        const incoming=this.vehicles.find(o=>o!==v&&!o.arrived&&!o.inGarage&&o.route.toHouse===v.route.fromHouse
-          &&o.route.total-o.s<o.route.arrivalLength+spec.length
-          &&Array.from({length:17},(_,i)=>i/16).some(t=>Array.from({length:17},(_,i)=>i/16).some(u=>overlaps(v.route.at(v.route.departureLength*t,v.offset),v.kind,o.route.at(o.s+(o.route.total-o.s)*u,o.offset),o.kind,.5))));
-        if(incoming)v.garageYield=incoming.id;
-      }
-      if(v.garageYield!==undefined&&!this.vehicles.some(o=>o.id===v.garageYield&&!o.arrived))v.garageYield=undefined;
-      let desired=this.vehicles.some(o=>o.garageYield===v.id&&!o.inGarage&&!o.arrived)?0:spec.speed;const look=spec.length/2+v.speed*.85+1;
-      for(let d=.3;d<=look;d+=.5){if(!safe(v.route.at(v.s+d,v.offset),.12)){desired=Math.min(desired,Math.sqrt(Math.max(0,d-.25)*4));break;}}
-      // Yield only to another moving body on a conflicting short-term trajectory.
-      // A vehicle elsewhere in the same junction never reserves the whole junction.
-      for(const other of near){
-        if(other===v||other.arrived||other.inGarage||other.garageYield===v.id||other.speed<.3)continue;
-        const otherTurn=other.route.upcomingTurn(other.s,12);
-        // Through traffic has priority regardless of spawn order. Check the
-        // entire upcoming bend so we wait before entering its conflict area.
-        if(turn&&!otherTurn){
-          let conflict=Infinity;
-          const end=Math.min(turn.end+spec.length/2,v.s+28);
-          for(let s=Math.max(v.s,turn.start-spec.length/2);s<=end;s+=1){
-            const arrival=(s-v.s)/Math.max(v.speed,3);
-            if(arrival>4)break;
-            for(const slack of [-.7,0,.7]){
-              const time=Math.max(0,arrival+slack);
-              if(overlaps(v.route.at(s,v.offset),v.kind,other.route.at(other.s+other.speed*time,other.offset),other.kind,.4)){conflict=s;break;}
-            }
-            if(conflict<Infinity)break;
-          }
-          if(conflict<Infinity)desired=Math.min(desired,Math.sqrt(Math.max(0,Math.min(turn.start-spec.length/2-.8,conflict-2)-v.s)*4));
-          continue;
-        }
-        if(other.id>v.id)continue;
-        const margin=Math.cos(other.pose.angle-v.pose.angle)>.85?.12:.3;
-        for(let time=.3;time<=2.4;time+=.3){
-          const travel=Math.max(v.speed,2)*time;
-          if(overlaps(v.route.at(v.s+travel,v.offset),v.kind,other.route.at(other.s+other.speed*time,other.offset),other.kind,margin)){
-            desired=Math.min(desired,Math.sqrt(Math.max(0,travel-spec.length/2-1)*4));break;
-          }
-        }
-      }
-      for(const signal of v.route.signals){const gap=signal.s-v.s-spec.length/2;if(gap>=-.25&&gap<20&&!lightGreen(this.time,signal.light,signal.vertical))desired=Math.min(desired,Math.sqrt(Math.max(0,gap)*4));}
-      v.speed+=clamp(desired-v.speed,-5*dt,2.3*dt);
-      // Up to 35 degrees of steering; lateral travel follows a curved heading
-      // rather than moving the body sideways at its original orientation.
-      const lateralRate=Math.max(.85,v.speed*Math.tan(35*Math.PI/180));
-      const nextOffset=clamp(v.offset+clamp(v.targetOffset-v.offset,-lateralRate*dt,lateralRate*dt),-bound,bound);
-      let nextS=Math.min(v.route.total,v.s+v.speed*dt);let pose:Pose=v.route.at(nextS,nextOffset);
-      // Every movement is swept in <= 10 cm increments, including lateral movement.
-      const startOffset=v.offset;
-      const motionPose=(s:number,offset:number,t=1):Pose=>{
-        const p=v.route.at(s,offset),advance=s-v.s;
-        const heading=p.angle+(Math.abs(advance)>.00001?clamp(Math.atan((offset-startOffset)/advance),-.61,.61):0);
-        const delta=Math.atan2(Math.sin(heading-v.pose.angle),Math.cos(heading-v.pose.angle));
-        const rotated={...p,angle:v.pose.angle+clamp(delta,-dt*1.8,dt*1.8)*t};
-        // Hold the steering angle when rotating a corner would touch another body.
-        const held={...p,angle:v.pose.angle};
-        return !safe(rotated,.08)&&safe(held,.08)?held:rotated;
-      };
-      const sweep=(s:number,offset:number)=>{const steps=Math.max(1,Math.ceil((Math.abs(s-v.s)+Math.abs(offset-startOffset))/.1));for(let i=1;i<=steps;i++)if(!safe(motionPose(v.s+(s-v.s)*i/steps,startOffset+(offset-startOffset)*i/steps,i/steps),.08))return false;return true;};
-      const oldCell=cell(v.pose);let moved=sweep(nextS,nextOffset);
-      if(moved){v.offset=nextOffset;}else if(sweep(nextS,v.offset)){pose=v.route.at(nextS,v.offset);moved=true;}else if(sweep(v.s,nextOffset)){nextS=v.s;pose=v.route.at(v.s,nextOffset);v.offset=nextOffset;v.speed=0;}else{nextS=v.s;pose=v.pose;v.speed=0;}
-      // Either participant may need to reverse: ID priority must not trap a
-      // vehicle whose counterpart has no room behind it. Let its queue back up
-      // as well, including shallow merges, using the swept gate for every move.
-      let yielding=this.yielding.get(v.id);
-      if(yielding&&(this.time>yielding.until||!near.some(o=>o.id===yielding?.other))){this.yielding.delete(v.id);yielding=undefined;}
-      if(!yielding&&nextS-v.s<.002&&v.waiting>2){
-        // A turning body may hit within the first millimetres yet be clear
-        // at 30 cm. Match the near-field checks to the movement sweep.
-        const blocker=near.find(o=>o!==v&&o.waiting>1
-          &&(v.waiting>4||Math.cos(o.pose.angle-v.pose.angle)<.999||this.yielding.has(o.id))
-          &&[.001,.01,.03,.1,.2,.3].some(d=>overlaps(motionPose(v.s+d,v.offset),v.kind,o.pose,o.kind,.08)));
-        if(blocker){yielding={other:blocker.id,until:this.time+8,backTo:Math.max(0,v.s-4)};this.yielding.set(v.id,yielding);}
-      }
-      if(yielding&&v.s>yielding.backTo){
-        const back=Math.max(yielding.backTo,v.s-dt*.9);
-        if(sweep(back,v.offset)){nextS=back;pose=v.route.at(back,v.offset);v.speed=0;}
-      }
-      // At a tight merge, backing up can rotate a corner into the blocker.
-      // Slide aside on the actual road surface before trying to reverse again.
-      if(Math.abs(nextS-v.s)<.001&&v.waiting>3){
-        let escape:number|undefined,best=0;
-        const clearance=(p:Pose)=>near.filter(o=>o!==v&&!o.arrived).reduce((min,o)=>Math.min(min,dist(p,o.pose)),Infinity);
-        const current=clearance(v.pose);
-        for(const offset of [v.offset-dt*.85,v.offset+dt*.85]){
-          const p=v.route.at(v.s,offset),road=this.world.nearest(p);
-          if(Math.abs(offset)>bound&&(!road||road.distance+spec.width/2+.28>road.road.width*(road.road.oneWay?.5:1)))continue;
-          const gain=clearance(p)-current;
-          if(gain>best&&sweep(v.s,offset)){best=gain;escape=offset;}
-        }
-        if(escape!==undefined){v.offset=escape;nextS=v.s;pose=v.route.at(v.s,escape);v.speed=0;}
-      }
-      if(Math.abs(nextS-v.s)<.001&&v.waiting>4&&(desired<.1||!moved)&&v.garageYield===undefined
-        &&!v.route.signals.some(signal=>Math.abs(signal.s-v.s-spec.length/2)<1.5&&!lightGreen(this.time,signal.light,signal.vertical))){
-        let bestGain=0;
-        for(const direction of [-1,1])for(const lateral of [-1,0,1]){
-          const trialS=clamp(v.s+direction*dt*.9,0,v.route.total);
-          const trialOffset=clamp(startOffset+lateral*dt*.85,-bound,bound);
-          const candidate=motionPose(trialS,trialOffset);
-          const clearance=(p:Pose)=>near.filter(o=>o!==v&&!o.arrived&&!o.inGarage).reduce((sum,o)=>sum+1/Math.max(.1,dist(p,o.pose))**2,0);
-          const gain=clearance(v.pose)-clearance(candidate);
-          if(gain>bestGain&&sweep(trialS,trialOffset)){bestGain=gain;nextS=trialS;v.offset=trialOffset;pose=candidate;v.speed=0;}
-        }
-      }
-      if(v.garageYield!==undefined){
-        const back=Math.max(0,v.s-dt*1.5);
-        if(sweep(back,v.offset)){nextS=back;pose=motionPose(back,v.offset);v.speed=0;}
-        else{nextS=v.s;pose=motionPose(v.s,v.offset);v.speed=0;}
-        if(nextS<=.001){v.inGarage=true;v.offset=v.targetOffset=0;nextS=0;}
-      }
-      if(v.inGarage)pose={...v.route.at(0),y:-10};
-      else if(sweep(nextS,v.offset))pose=motionPose(nextS,v.offset);
-      else{nextS=v.s;v.offset=startOffset;pose=v.pose;v.speed=0;}
-      const advance=nextS-v.s;v.blocked=advance<.003;v.waiting=v.blocked?v.waiting+dt:Math.max(0,v.waiting-dt*2);v.s=nextS;v.pose=pose;
-      if(v.inGarage){grid.set(oldCell,(grid.get(oldCell)??[]).filter(o=>o!==v));}
-      else if(oldCell!==cell(pose)){grid.set(oldCell,grid.get(oldCell)!.filter(o=>o!==v));insert(v);}
-      if(v.s>=v.route.total-.1){v.arrived=true;this.completed++;this.yielding.delete(v.id);}
+    if(this.paused||!Number.isFinite(dt)||dt<=0)return;
+    // Bound integration and decision intervals even when callers supply a large delta.
+    const count=Math.ceil(dt/(1/60)),slice=dt/count;
+    for(let i=0;i<count;i++){
+      this.time+=slice;this.spawnClock+=slice;
+      if(this.spawnClock>.55&&this.vehicles.length<this.target){this.spawnClock=0;this.spawn();}
+      this.driving.step(this,slice);
+      this.vehicles=this.vehicles.filter(v=>!v.arrived);
     }
-    this.vehicles=this.vehicles.filter(v=>!v.arrived);
   }
 }
 export function demoWorld(){

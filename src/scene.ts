@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VehicleDirections } from './vehicle-directions';
-import { World, Simulation, SPECS, type Point, type Vehicle, type Road, type Pose, lightGreen, pt, dist } from './simulation';
+import { World, Simulation, SPECS, type Point, type Vehicle, type Road, type Pose, signalState, pt, dist } from './simulation';
 
 const materials=new Map<string,THREE.MeshStandardMaterial>();
 function mat(color:number,roughness=.8){const key=`${color}-${roughness}`;if(!materials.has(key))materials.set(key,new THREE.MeshStandardMaterial({color,roughness}));return materials.get(key)!;}
@@ -16,7 +16,7 @@ function ribbon(points:Point[],width:number,color:number,height=.06){
 function offsetPath(points:Point[],offset:number){return points.map((p,i)=>{const a=points[Math.max(0,i-1)],b=points[Math.min(points.length-1,i+1)],l=dist(a,b)||1;return {...p,x:p.x+(b.z-a.z)/l*offset,z:p.z-(b.x-a.x)/l*offset};});}
 export class CityScene {
   renderer:THREE.WebGLRenderer;scene=new THREE.Scene();camera=new THREE.OrthographicCamera();controls:OrbitControls;
-  city=new THREE.Group();cars=new THREE.Group();ghost=new THREE.Group();carMeshes=new Map<number,THREE.Group>();signalMeshes:{mesh:THREE.Mesh;index:number;vertical:boolean}[]=[];
+  city=new THREE.Group();cars=new THREE.Group();ghost=new THREE.Group();carMeshes=new Map<number,THREE.Group>();signalMeshes:{mesh:THREE.Mesh;index:number;vertical:boolean;turn?:'straight'|'left'|'right'}[]=[];
   ray=new THREE.Raycaster();pointer=new THREE.Vector2();night=false;debug=false;sun:THREE.DirectionalLight;ambient:THREE.HemisphereLight;
   showDirections=false;directions=new VehicleDirections();
   selectedVehicleId:number|null=null;
@@ -96,7 +96,7 @@ export class CityScene {
       group.add(box(1.15,2,.1,0x5a756c,0,1.3,3.05));group.add(box(2.5,.12,1,0xe7dcca,0,.3,3.7));
       for(let floor=0;floor<Math.floor(height/2.8);floor++)for(const x of [-2,2]){group.add(box(1.1,1.2,.08,0x63898b,x,2+floor*2.8,3.06));group.add(box(.08,1.2,1.1,0x63898b,3.34,2+floor*2.8,x));group.add(box(1.25,.12,.35,0xf4efdd,x,1.36+floor*2.8,3.15));}
       group.position.set(h.x,0,h.z);group.rotation.y=h.angle;this.city.add(group);
-      const q=world.nearest(pt(h.x,h.z));if(q)this.city.add(ribbon([pt(h.x,h.z),q.point],3.2,0xb5b6a6,.025));
+      const q=world.nearest(pt(h.x,h.z));if(q)this.city.add(ribbon([pt(h.x,h.z),q.point],6.4,0xb5b6a6,.025));
     }
     let seed=42;const random=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296;};
     for(let i=0;i<260;i++){
@@ -109,7 +109,15 @@ export class CityScene {
     world.lights.forEach((light,index)=>{
       for(const vertical of [false,true]){
         const x=light.x+(vertical?-6:6),z=light.z+(vertical?6:-6);this.city.add(cylinder(.13,4,0x475550,x,2,z));this.city.add(box(.65,1.4,.5,0x34433e,x,4.1,z));
-        const lens=new THREE.Mesh(new THREE.SphereGeometry(.2,8,8),new THREE.MeshStandardMaterial({color:0xe85645,emissive:0xe85645,emissiveIntensity:1}));lens.position.set(x,4.3,z+.3);this.city.add(lens);this.signalMeshes.push({mesh:lens,index,vertical});
+        const lens=new THREE.Mesh(new THREE.SphereGeometry(.2,8,8),new THREE.MeshStandardMaterial({color:0xe85645,emissive:0xe85645,emissiveIntensity:1}));(lens.material as THREE.Material).userData.transient=true;lens.position.set(x,4.3,z+.3);this.city.add(lens);this.signalMeshes.push({mesh:lens,index,vertical});
+        if(light.phases){
+          for(const [i,turn] of (['left','straight','right'] as const).entries()){
+            const shape=new THREE.Shape();shape.moveTo(-.14,-.08);shape.lineTo(.03,-.08);shape.lineTo(.03,-.16);shape.lineTo(.22,0);shape.lineTo(.03,.16);shape.lineTo(.03,.08);shape.lineTo(-.14,.08);shape.closePath();
+            const material=new THREE.MeshStandardMaterial({color:0xf26352,emissive:0xf26352,emissiveIntensity:1});material.userData.transient=true;
+            const arrow=new THREE.Mesh(new THREE.ShapeGeometry(shape),material);arrow.rotation.z=turn==='left'?Math.PI:turn==='straight'?Math.PI/2:0;arrow.position.set(x+(i-1)*.48,3.7,z+.31);this.city.add(arrow);this.signalMeshes.push({mesh:arrow,index,vertical,turn});
+          }
+        }
+
       }
     });
   }
@@ -129,23 +137,41 @@ export class CityScene {
     g.userData.vehicleId=v.id;
     if(v.kind==='bike'){
       g.add(box(.55,.55,1.4,color,0,.65,0));g.add(box(.45,.2,.7,0x394740,0,.98,-.1));g.add(box(.55,.7,.4,0x506866,0,1.3,-.15));g.add(cylinder(.27,.35,v.id%2?0xf0e1b6:0xe3a985,0,1.85,-.12));g.add(box(.9,.07,.12,0x34453e,0,1.13,.55));
-      for(const z of [-.7,.7]){const wheel=new THREE.Mesh(new THREE.CylinderGeometry(.31,.31,.18,10),mat(0x303a34));wheel.rotation.z=Math.PI/2;wheel.position.set(0,.34,z);g.add(wheel);}
+      for(const z of [-.7,.7]){const wheel=new THREE.Mesh(new THREE.CylinderGeometry(.31,.31,.18,10),mat(0x303a34));wheel.rotation.z=Math.PI/2;wheel.position.set(0,.34,z);if(z>0)wheel.name='front-wheel';g.add(wheel);}
     }else{
       g.add(box(s.width,.65,s.length,color,0,.75,0));
       if(v.kind==='car'){g.add(box(s.width*.84,.65,s.length*.49,color,0,1.36,-.15));g.add(box(s.width*.77,.42,.1,0x6a9296,0,1.42,.86));g.add(box(s.width*.77,.4,.1,0x6a9296,0,1.42,-1.17));for(const x of [-s.width*.427,s.width*.427])g.add(box(.04,.4,1.5,0x6a9296,x,1.42,-.15));}
       else{g.add(box(s.width*.97,2.1,4.1,0xe9e3d3,0,1.7,-.8));g.add(box(s.width,.9,1.65,color,0,1.5,2.25));g.add(box(s.width*.85,.6,.06,0x648b91,0,1.6,3.09));}
-      for(const x of [-s.width/2+.13,s.width/2-.13])for(const z of [-s.length*.31,s.length*.31]){const wheel=new THREE.Mesh(new THREE.CylinderGeometry(.39,.39,.25,10),mat(0x344039));wheel.rotation.z=Math.PI/2;wheel.position.set(x,.4,z);g.add(wheel);}
+      for(const x of [-s.width/2+.13,s.width/2-.13])for(const z of [-s.length*.31,s.length*.31]){const wheel=new THREE.Mesh(new THREE.CylinderGeometry(.39,.39,.25,10),mat(0x344039));wheel.rotation.z=Math.PI/2;wheel.position.set(x,.4,z);if(z>0)wheel.name='front-wheel';g.add(wheel);}
       for(const x of [-s.width*.33,s.width*.33]){g.add(box(.3,.18,.05,0xfff0c5,x,.85,s.length/2+.03));g.add(box(.3,.17,.05,0xbf5d4f,x,.85,-s.length/2-.03));}
     }
-    const wire=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(s.width+.16,2.1,s.length+.16)),new THREE.LineBasicMaterial({color:0xecae46}));wire.position.y=1.1;wire.name='collision';wire.visible=this.debug;g.add(wire);g.traverse(o=>{if(o instanceof THREE.Mesh)o.castShadow=true;});this.cars.add(g);this.carMeshes.set(v.id,g);return g;
+    const lamp=(name:string,color:number,x:number,z:number,w=.2)=>{
+      const material=new THREE.MeshBasicMaterial({color,toneMapped:false});material.userData.transient=true;
+      const light=new THREE.Mesh(new THREE.BoxGeometry(w,.14,.07),material);light.name=name;light.position.set(x,v.kind==='bike'?.8:.9,z);g.add(light);
+    };
+    for(const side of [-1,1]){
+      const x=side*s.width*.36;
+      lamp('brake',0xff2929,x,-s.length/2-.05);
+      lamp('reverse',0xf5ffff,x*.55,-s.length/2-.08,.12);
+      for(const z of [-s.length/2-.09,s.length/2+.05])lamp(side>0?'indicator-left':'indicator-right',0xffad18,x,z,.14);
+    }
+    const wire=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(s.width+.16,2.1,s.length+.16)),new THREE.LineBasicMaterial({color:0xecae46}));(wire.material as THREE.Material).userData.transient=true;wire.position.y=1.1;wire.name='collision';wire.visible=this.debug;g.add(wire);g.traverse(o=>{if(o instanceof THREE.Mesh)o.castShadow=true;});this.cars.add(g);this.carMeshes.set(v.id,g);return g;
   }
   update(sim:Simulation,alpha=1){
     const ids=new Set(sim.vehicles.map(v=>v.id));for(const [id,g]of this.carMeshes)if(!ids.has(id)){dispose(g);this.cars.remove(g);this.carMeshes.delete(id);}
     for(const v of sim.vehicles){const g=this.carMeshes.get(v.id)??this.makeVehicle(v);const old=g.userData.pose as Pose|undefined,p=v.pose;
       g.visible=!v.inGarage;const blend=old?alpha:1;g.position.lerp(new THREE.Vector3(p.x,p.y+.12,p.z),blend);let angle=p.angle-g.rotation.y;angle=Math.atan2(Math.sin(angle),Math.cos(angle));g.rotation.y+=angle*blend;g.userData.pose=p;g.getObjectByName('collision')!.visible=this.debug;
+      g.traverse(child=>{
+        if(child.name==='brake')child.visible=!!v.braking;
+        if(child.name==='reverse')child.visible=(v.velocity??0)<-.01;
+        if(child.name==='indicator-left')child.visible=v.indicator===-1&&Math.floor(sim.time*2.8)%2===0;
+        if(child.name==='indicator-right')child.visible=v.indicator===1&&Math.floor(sim.time*2.8)%2===0;
+        if(child.name==='front-wheel')child.rotation.y=v.steering??0;
+      });
+      g.rotation.z=v.kind==='bike'?THREE.MathUtils.clamp(-((v.velocity??0)**2)*Math.tan(v.steering??0)/(SPECS.bike.wheelbase*9.81),-.28,.28):0;
       const next=v.route.at(Math.min(v.route.total,v.s+.8)),prev=v.route.at(Math.max(0,v.s-.8));g.rotation.x=Math.atan2(next.y-prev.y,dist(prev,next)||1)*-.8;
     }
-    for(const signal of this.signalMeshes){const light=sim.world.lights[signal.index];if(light){const green=lightGreen(sim.time,light,signal.vertical);const m=signal.mesh.material as THREE.MeshStandardMaterial;m.color.setHex(green?0x7cda8a:0xf26352);m.emissive.copy(m.color);}}
+    for(const signal of this.signalMeshes){const light=sim.world.lights[signal.index];if(light){const state=signalState(sim.time,light,signal.vertical,signal.turn);const m=signal.mesh.material as THREE.MeshStandardMaterial;m.color.setHex(state==='green'?0x7cda8a:state==='yellow'?0xffc34b:0xf26352);m.emissive.copy(m.color);}}
     const selected=sim.vehicles.find(v=>v.id===this.selectedVehicleId&&!v.inGarage);
     if(!selected)this.selectedVehicleId=null;
     this.selectionRing.visible=!!selected;

@@ -12,3 +12,7 @@
 .map-controls button[aria-pressed="true"]{background:#dce9d4;color:#315e48;box-shadow:inset 0 0 0 1px #9bb68f}.camera-orbit{display:grid;grid-template-columns:repeat(2,28px);gap:1px}.camera-orbit button{width:28px;height:28px;font-size:20px}.camera-orbit #camera-up,.camera-orbit #camera-down{grid-column:1/3;justify-self:center}.map-controls>button{align-self:center}
 
 .driving-side-card>label{display:block;font-size:11px;font-weight:550;margin-bottom:10px}.driving-side-card select{width:100%;padding:10px;border:1px solid #cbd8c2;border-radius:6px;background:#fff;color:#375a42;font:inherit;font-size:11px;cursor:pointer}.driving-side-card select:focus-visible{outline:3px solid #e1b661;outline-offset:3px}.driving-side-card p{font-size:9px;color:#83907d;line-height:1.8;margin:10px 0 0}
+
+#selected-road label { display: block; margin: 12px 0 6px; font-size: 12px; color: #53665c; }
+#selected-road select { width: 100%; padding: 9px 10px; border: 1px solid #d5ded3; border-radius: 9px; background: #fffdf6; color: #34493d; font: inherit; font-size: 12px; }
+#selected-road .wide-button { margin-top: 12px; }
