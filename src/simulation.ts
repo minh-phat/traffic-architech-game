@@ -282,13 +282,18 @@ export class Simulation {
       const sweep=(s:number,offset:number)=>{const steps=Math.max(1,Math.ceil((Math.abs(s-v.s)+Math.abs(offset-startOffset))/.1));for(let i=1;i<=steps;i++)if(!safe(v.route.at(v.s+(s-v.s)*i/steps,startOffset+(offset-startOffset)*i/steps),.08))return false;return true;};
       const oldCell=cell(v.pose);let moved=sweep(nextS,nextOffset);
       if(moved){v.offset=nextOffset;}else if(sweep(nextS,v.offset)){pose=v.route.at(nextS,v.offset);moved=true;}else if(sweep(v.s,nextOffset)){nextS=v.s;pose=v.route.at(v.s,nextOffset);v.offset=nextOffset;v.speed=0;}else{nextS=v.s;pose=v.pose;v.speed=0;}
-      // A lower-priority vehicle can carefully reverse to release a mutual blockage.
-      // Reversing uses the same swept collision gate; there is no teleport recovery.
+      // Either participant may need to reverse: ID priority must not trap a
+      // vehicle whose counterpart has no room behind it. Let its queue back up
+      // as well, including shallow merges, using the swept gate for every move.
       let yielding=this.yielding.get(v.id);
       if(yielding&&(this.time>yielding.until||!near.some(o=>o.id===yielding?.other))){this.yielding.delete(v.id);yielding=undefined;}
       if(!yielding&&nextS-v.s<.002&&v.waiting>2){
-        const blocker=near.find(o=>o!==v&&o.id<v.id&&o.waiting>1&&Math.cos(o.pose.angle-v.pose.angle)<.5&&overlaps(v.route.at(v.s+.3,v.offset),v.kind,o.pose,o.kind,.08));
-        if(blocker){yielding={other:blocker.id,until:this.time+3,backTo:Math.max(0,v.s-2.4)};this.yielding.set(v.id,yielding);}
+        // A turning body may hit within the first millimetres yet be clear
+        // at 30 cm. Match the near-field checks to the movement sweep.
+        const blocker=near.find(o=>o!==v&&o.waiting>1
+          &&(Math.cos(o.pose.angle-v.pose.angle)<.95||this.yielding.has(o.id))
+          &&[.001,.01,.03,.1,.2,.3].some(d=>overlaps(v.route.at(v.s+d,v.offset),v.kind,o.pose,o.kind,.08)));
+        if(blocker){yielding={other:blocker.id,until:this.time+8,backTo:Math.max(0,v.s-4)};this.yielding.set(v.id,yielding);}
       }
       if(yielding&&v.s>yielding.backTo){
         const back=Math.max(yielding.backTo,v.s-dt*.9);

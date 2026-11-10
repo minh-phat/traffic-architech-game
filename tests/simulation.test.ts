@@ -143,3 +143,16 @@ test('mixed traffic never overlaps during a deterministic 120-second city simula
   console.log(`120 s: ${sim.completed} completed, ${sim.vehicles.length} active; no overlaps.`);
 });
 test('paused simulation leaves time and vehicle positions unchanged',()=>{const sim=new Simulation(demoWorld(),seeded());for(let i=0;i<180;i++)sim.step();const before=JSON.stringify(sim.vehicles);sim.paused=true;const time=sim.time;sim.step();assert.equal(sim.time,time);assert.equal(JSON.stringify(sim.vehicles),before);});
+
+test('moderate city traffic drains after spawning stops instead of locking at crossings',()=>{
+  for(const dt of [1/30,1/60])for(const seed of [1,7,42]){
+    const sim=new Simulation(demoWorld(),seeded(seed));sim.target=25;
+    // Two minutes of arrivals, followed by four minutes to clear the network.
+    for(let i=0;i<Math.round(360/dt);i++){
+      if(i===Math.round(120/dt))sim.target=0;
+      sim.step(dt);assertNoOverlap(sim);
+    }
+    assert.ok(sim.completed>25,`Seed ${seed}: insufficient completed trips`);
+    assert.equal(sim.vehicles.length,0,`Seed ${seed}, dt=${dt}: ${sim.vehicles.length} vehicles failed to clear`);
+  }
+});
