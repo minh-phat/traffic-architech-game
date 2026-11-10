@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VehicleBlockage } from './vehicle-blockage';
 import { VehicleDirections } from './vehicle-directions';
 import { World, Simulation, SPECS, type Point, type Vehicle, type Road, type Pose, signalState, pt, dist } from './simulation';
 
@@ -18,7 +19,7 @@ export class CityScene {
   renderer:THREE.WebGLRenderer;scene=new THREE.Scene();camera=new THREE.OrthographicCamera();controls:OrbitControls;
   city=new THREE.Group();cars=new THREE.Group();ghost=new THREE.Group();carMeshes=new Map<number,THREE.Group>();signalMeshes:{mesh:THREE.Mesh;index:number;vertical:boolean;turn?:'straight'|'left'|'right'}[]=[];
   ray=new THREE.Raycaster();pointer=new THREE.Vector2();night=false;debug=false;sun:THREE.DirectionalLight;ambient:THREE.HemisphereLight;
-  showDirections=false;directions=new VehicleDirections();
+  showDirections=false;directions=new VehicleDirections();blockage=new VehicleBlockage();
   selectedVehicleId:number|null=null;
   selectionRing=new THREE.Mesh(new THREE.RingGeometry(.84,1,40).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xffd45c,side:THREE.DoubleSide,toneMapped:false,depthWrite:false}));
   constructor(public canvas:HTMLCanvasElement,public container:HTMLElement){
@@ -28,7 +29,7 @@ export class CityScene {
     this.ambient=new THREE.HemisphereLight(0xeaf5ff,0x7e8a69,2.3);this.scene.add(this.ambient);
     this.sun=new THREE.DirectionalLight(0xffeed6,3.5);this.sun.position.set(-75,130,65);this.sun.castShadow=true;this.sun.shadow.mapSize.set(2048,2048);Object.assign(this.sun.shadow.camera,{left:-145,right:145,top:145,bottom:-145,near:1,far:350});this.sun.shadow.bias=-.0005;this.sun.shadow.normalBias=.25;this.scene.add(this.sun);
     this.selectionRing.visible=false;this.selectionRing.renderOrder=5;
-    this.scene.add(this.city,this.cars,this.ghost,this.directions.group,this.selectionRing);this.resize();new ResizeObserver(()=>this.resize()).observe(container);
+    this.scene.add(this.city,this.cars,this.ghost,this.directions.group,this.blockage.group,this.selectionRing);this.resize();new ResizeObserver(()=>this.resize()).observe(container);
   }
   resize(){const {width,height}=this.container.getBoundingClientRect();this.renderer.setSize(width,height,false);const aspect=width/height,span=95;this.camera.left=-span*aspect;this.camera.right=span*aspect;this.camera.top=span;this.camera.bottom=-span;this.camera.updateProjectionMatrix();}
   pick(clientX:number,clientY:number){const rect=this.canvas.getBoundingClientRect();this.pointer.set((clientX-rect.left)/rect.width*2-1,-(clientY-rect.top)/rect.height*2+1);this.ray.setFromCamera(this.pointer,this.camera);const p=new THREE.Vector3();return this.ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0),0),p)?pt(p.x,p.z):null;}
@@ -181,6 +182,7 @@ export class CityScene {
       this.selectionRing.rotation.y=selected.pose.angle;
       this.selectionRing.scale.set(spec.width/2+.65,1,spec.length/2+.65);
     }
+    this.blockage.update(selected,sim.vehicles);
     this.directions.update(selected?[selected]:sim.vehicles.filter(v=>!v.inGarage),!!selected||this.showDirections);
     this.controls.update();this.renderer.render(this.scene,this.camera);
   }

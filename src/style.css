@@ -16,3 +16,5 @@
 #selected-road label { display: block; margin: 12px 0 6px; font-size: 12px; color: #53665c; }
 #selected-road select { width: 100%; padding: 9px 10px; border: 1px solid #d5ded3; border-radius: 9px; background: #fffdf6; color: #34493d; font: inherit; font-size: 12px; }
 #selected-road .wide-button { margin-top: 12px; }
+
+#vehicle-blockage{color:#ac4035;border-left:3px solid #f04e42;padding-left:9px;line-height:1.7}
