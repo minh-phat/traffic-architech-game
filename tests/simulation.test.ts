@@ -210,3 +210,31 @@ test('legacy roundabout saves adopt the default driving side and remain switchab
   assert.equal(JSON.stringify(straight.points),before);
   for(const arc of arcs)assert.deepEqual(arc.points,old.roads.find(r=>r.id===arc.id)!.points);
 });
+
+test('turn preparation moves toward the turn within the lane',()=>{
+  for(const direction of [-1,1]){
+    const route=new Route(sampled([pt(0,-35),pt(0,0),pt(direction*30,0)]).map(p=>({...p,width:5})),[]);
+    assert.equal(route.turns.length,1);
+    assert.equal(route.turns[0].direction,direction);
+    const sim=new Simulation(new World(),seeded());sim.target=0;
+    const driver=vehicle(1,route,route.turns[0].start-14);sim.vehicles=[driver];
+    for(let i=0;i<60;i++)sim.step();
+    assert.ok(driver.offset*direction>.3);
+    assert.ok(Math.abs(driver.offset)<(5-SPECS.car.width)/2);
+  }
+});
+
+test('turning traffic yields to a conflicting straight vehicle regardless of ID',()=>{
+  for(const turningId of [1,2]){
+    const turn=new Route(sampled([pt(-30,0),pt(0,0),pt(0,30)]).map(p=>({...p,width:5})),[]);
+    const straight=new Route(sampled([pt(0,30),pt(0,-30)]).map(p=>({...p,width:5})),[]);
+    const sim=new Simulation(new World(),seeded());sim.target=0;
+    const turning=vehicle(turningId,turn,turn.turns[0].start-10);
+    const through=vehicle(3-turningId,straight,12);
+    sim.vehicles=[turning,through];
+    sim.step();assert.ok(turning.speed<6,'Turner must brake for through traffic');
+    assert.ok(through.speed>=6,'Through traffic keeps priority');
+    for(let i=0;i<1200;i++){sim.step();assertNoOverlap(sim);}
+    assert.equal(sim.completed,2);
+  }
+});

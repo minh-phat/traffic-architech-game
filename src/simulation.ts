@@ -134,18 +134,33 @@ type WayPoint=Point&{width:number};
 export type Pose=Point&{angle:number};
 export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number};
 export class Route {
+  turns:{start:number;end:number;direction:number}[]=[];
   points:WayPoint[]; lengths:number[]=[0]; total:number; signals:{s:number;light:Light;vertical:boolean}[]=[];
   constructor(raw:WayPoint[],lights:Light[]) {
     let points=raw.filter((p,i)=>!i||dist(p,raw[i-1])>.05);
     // Chaikin corners stay inside the road's convex junction surface.
     for(let n=0;n<2;n++){const smooth=[points[0]];for(let i=1;i<points.length;i++){const a=points[i-1],b=points[i];smooth.push({...lerp(a,b,.25),width:Math.min(a.width,b.width)},{...lerp(a,b,.75),width:Math.min(a.width,b.width)});}smooth.push(points.at(-1)!);points=smooth;}
     this.points=points;for(let i=1;i<points.length;i++)this.lengths.push(this.lengths.at(-1)!+dist(points[i-1],points[i]));this.total=this.lengths.at(-1)!;
+    // Detect whole bends, including driveway entrances, rather than treating
+    // each small segment of a smooth corner as a separate manoeuvre.
+    let bend:{start:number;end:number;angle:number}|undefined;
+    const finish=()=>{if(bend&&Math.abs(bend.angle)>.4)this.turns.push({start:bend.start,end:bend.end,direction:Math.sign(bend.angle)});bend=undefined;};
+    for(let s=1;s<this.total-1;s+=1){
+      const a=this.at(s-1).angle,b=this.at(s).angle,delta=Math.atan2(Math.sin(b-a),Math.cos(b-a));
+      if(Math.abs(delta)>.012){
+        if(bend&&(s-bend.end>2||Math.sign(delta)!==Math.sign(bend.angle)))finish();
+        if(!bend)bend={start:Math.max(0,s-2),end:s+1,angle:0};
+        bend.end=s+1;bend.angle+=delta;
+      }else if(bend&&s-bend.end>2)finish();
+    }
+    finish();
     for(const light of lights){
       let nearest=Infinity,index=0,fraction=0,elevation=0;
       for(let i=1;i<points.length;i++){const q=project(pt(light.x,light.z),points[i-1],points[i]);if(q.distance<nearest){nearest=q.distance;index=i;fraction=q.t;elevation=q.point.y;}}
       if(nearest<9&&index>0&&elevation<1){const p=points[index],prev=points[index-1],s=this.lengths[index-1]+(this.lengths[index]-this.lengths[index-1])*fraction;this.signals.push({s:Math.max(0,s-8),light,vertical:Math.abs(p.z-prev.z)>Math.abs(p.x-prev.x)});}
     }
   }
+  upcomingTurn(s:number,ahead=16){return this.turns.find(t=>t.end>=s&&t.start<=s+ahead);}
   position(s:number):Point&{width:number} {
     s=clamp(s,0,this.total);let low=0,high=this.lengths.length-1;
     while(low+1<high){const mid=(low+high)>>1;if(this.lengths[mid]<=s)low=mid;else high=mid;}
@@ -285,9 +300,12 @@ export class Simulation {
       for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++)near.push(...(grid.get(`${x+dx},${z+dz}`)??[]));
       const safe=(p:Pose,margin=.16)=>!near.some(o=>o!==v&&!o.arrived&&overlaps(p,v.kind,o.pose,o.kind,margin));
       const bound=Math.max(0,(v.route.at(v.s).width-spec.width)/2-.28);
+      const turn=v.route.upcomingTurn(v.s);
       if(v.decision<=0){
-        const candidates=[v.offset,0,-bound,bound,-bound*.5,bound*.5];let best=v.offset,bestScore=-Infinity;
-        for(const offset of candidates){let free=0;for(let d=.6;d<=12;d+=.8){if(!safe(v.route.at(v.s+d,offset),.12))break;free=d;}const score=free-Math.abs(offset-v.offset)*.25-Math.abs(offset)*.04;if(score>bestScore){bestScore=score;best=offset;}}
+        const preparing=turn&&v.waiting<2;
+        const preferred=preparing?turn.direction*bound*.8:0;
+        const candidates=[v.offset,0,-bound,bound,-bound*.5,bound*.5,preferred];let best=v.offset,bestScore=-Infinity;
+        for(const offset of candidates){let free=0;for(let d=.6;d<=12;d+=.8){if(!safe(v.route.at(v.s+d,offset),.12))break;free=d;}const score=free-Math.abs(offset-v.offset)*.25-Math.abs(offset-preferred)*(preparing?.4:.04);if(score>bestScore){bestScore=score;best=offset;}}
         v.targetOffset=clamp(best,-bound,bound);v.decision=.3+this.random()*.25;
       }
       let desired=spec.speed;const look=spec.length/2+v.speed*.85+1;
@@ -295,7 +313,26 @@ export class Simulation {
       // Yield only to another moving body on a conflicting short-term trajectory.
       // A vehicle elsewhere in the same junction never reserves the whole junction.
       for(const other of near){
-        if(other===v||other.arrived||other.id>v.id||other.speed<.3)continue;
+        if(other===v||other.arrived||other.speed<.3)continue;
+        const otherTurn=other.route.upcomingTurn(other.s,12);
+        // Through traffic has priority regardless of spawn order. Check the
+        // entire upcoming bend so we wait before entering its conflict area.
+        if(turn&&!otherTurn){
+          let conflict=Infinity;
+          const end=Math.min(turn.end+spec.length/2,v.s+28);
+          for(let s=Math.max(v.s,turn.start-spec.length/2);s<=end;s+=1){
+            const arrival=(s-v.s)/Math.max(v.speed,3);
+            if(arrival>4)break;
+            for(const slack of [-.7,0,.7]){
+              const time=Math.max(0,arrival+slack);
+              if(overlaps(v.route.at(s,v.offset),v.kind,other.route.at(other.s+other.speed*time,other.offset),other.kind,.4)){conflict=s;break;}
+            }
+            if(conflict<Infinity)break;
+          }
+          if(conflict<Infinity)desired=Math.min(desired,Math.sqrt(Math.max(0,Math.min(turn.start-spec.length/2-.8,conflict-2)-v.s)*4));
+          continue;
+        }
+        if(other.id>v.id)continue;
         const margin=Math.cos(other.pose.angle-v.pose.angle)>.85?.12:.3;
         for(let time=.3;time<=2.4;time+=.3){
           const travel=Math.max(v.speed,2)*time;
@@ -338,7 +375,7 @@ export class Simulation {
         const current=clearance(v.pose);
         for(const offset of [v.offset-dt*.85,v.offset+dt*.85]){
           const p=v.route.at(v.s,offset),road=this.world.nearest(p);
-          if(!road||road.distance+spec.width/2+.28>road.road.width*(road.road.oneWay?.5:1))continue;
+          if(Math.abs(offset)>bound&&(!road||road.distance+spec.width/2+.28>road.road.width*(road.road.oneWay?.5:1)))continue;
           const gain=clearance(p)-current;
           if(gain>best&&sweep(v.s,offset)){best=gain;escape=offset;}
         }
