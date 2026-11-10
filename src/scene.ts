@@ -25,7 +25,7 @@ export class CityScene {
   constructor(public canvas:HTMLCanvasElement,public container:HTMLElement){
     this.renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:false});this.renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));this.renderer.shadowMap.enabled=true;this.renderer.shadowMap.type=THREE.PCFSoftShadowMap;this.renderer.setClearColor(0xe8ece4);this.renderer.outputColorSpace=THREE.SRGBColorSpace;this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=1.22;
     this.camera.position.set(130,155,150);this.camera.near=.1;this.camera.far=1000;
-    this.controls=new OrbitControls(this.camera,canvas);this.controls.target.set(0,0,3);this.controls.enableDamping=true;this.controls.dampingFactor=.08;this.controls.maxPolarAngle=Math.PI/2.2;this.controls.minPolarAngle=.001;this.controls.minZoom=.45;this.controls.maxZoom=4;this.controls.mouseButtons={LEFT:THREE.MOUSE.PAN,MIDDLE:THREE.MOUSE.PAN,RIGHT:THREE.MOUSE.ROTATE};this.controls.update();
+    this.controls=new OrbitControls(this.camera,canvas);this.controls.target.set(0,0,3);this.controls.enableDamping=true;this.controls.dampingFactor=.08;this.controls.maxPolarAngle=Math.PI/2.2;this.controls.minPolarAngle=.001;this.controls.minZoom=.45;this.controls.maxZoom=15;this.controls.mouseButtons={LEFT:THREE.MOUSE.PAN,MIDDLE:THREE.MOUSE.PAN,RIGHT:THREE.MOUSE.ROTATE};this.controls.update();
     this.ambient=new THREE.HemisphereLight(0xeaf5ff,0x7e8a69,2.3);this.scene.add(this.ambient);
     this.sun=new THREE.DirectionalLight(0xffeed6,3.5);this.sun.position.set(-75,130,65);this.sun.castShadow=true;this.sun.shadow.mapSize.set(2048,2048);Object.assign(this.sun.shadow.camera,{left:-145,right:145,top:145,bottom:-145,near:1,far:350});this.sun.shadow.bias=-.0005;this.sun.shadow.normalBias=.25;this.scene.add(this.sun);
     this.selectionRing.visible=false;this.selectionRing.renderOrder=5;
@@ -62,7 +62,7 @@ export class CityScene {
     return null;
   }
   home(){this.camera.position.set(130,155,150);this.controls.target.set(0,0,3);this.camera.zoom=1;this.camera.updateProjectionMatrix();this.controls.update();}
-  zoom(factor:number){this.camera.zoom=THREE.MathUtils.clamp(this.camera.zoom*factor,.45,4);this.camera.updateProjectionMatrix();}
+  zoom(factor:number){this.camera.zoom=THREE.MathUtils.clamp(this.camera.zoom*factor,this.controls.minZoom,this.controls.maxZoom);this.camera.updateProjectionMatrix();}
   setCameraInteraction(rotate:boolean,exploring:boolean){
     this.controls.mouseButtons.LEFT=exploring?(rotate?THREE.MOUSE.ROTATE:THREE.MOUSE.PAN):null;
     this.controls.touches.ONE=exploring?(rotate?THREE.TOUCH.ROTATE:THREE.TOUCH.PAN):null;
