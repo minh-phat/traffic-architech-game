@@ -3,6 +3,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VehicleBlockage } from './vehicle-blockage';
 import { VehicleDirections } from './vehicle-directions';
+import { VehicleObservationGuide } from './vehicle-observation-guide';
+import { VehicleObservationLinks } from './vehicle-observation-links';
+import { observeVehicles, vehicleObservationPose, type VehicleObservations } from './vehicle-perception';
 import { World, Simulation, SPECS, type Point, type Vehicle, type Road, type Pose, signalState, pt, dist } from './simulation';
 
 const materials=new Map<string,THREE.MeshStandardMaterial>();
@@ -13,6 +16,7 @@ function dispose(group:THREE.Object3D){group.traverse(o=>{if(o instanceof THREE.
 function ribbon(points:Point[],width:number,color:number,height=.06){
   const vertices:number[]=[],indices:number[]=[];
   points.forEach((p,i)=>{const a=points[Math.max(i-1,0)],b=points[Math.min(i+1,points.length-1)],l=dist(a,b)||1,nx=(b.z-a.z)/l,nz=-(b.x-a.x)/l;vertices.push(p.x+nx*width/2,p.y+height,p.z+nz*width/2,p.x-nx*width/2,p.y+height,p.z-nz*width/2);if(i<points.length-1){const v=i*2;indices.push(v,v+1,v+2,v+1,v+3,v+2);}});
+  mat(color).side=THREE.DoubleSide;
   const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(vertices,3));g.setIndex(indices);g.computeVertexNormals();const mesh=new THREE.Mesh(g,mat(color));mesh.receiveShadow=true;return mesh;
 }
 function offsetPath(points:Point[],offset:number){return points.map((p,i)=>{const a=points[Math.max(0,i-1)],b=points[Math.min(points.length-1,i+1)],l=dist(a,b)||1;return {...p,x:p.x+(b.z-a.z)/l*offset,z:p.z-(b.x-a.x)/l*offset};});}
@@ -21,8 +25,15 @@ export class CityScene {
   city=new THREE.Group();cars=new THREE.Group();ghost=new THREE.Group();carMeshes=new Map<number,THREE.Group>();signalMeshes:{mesh:THREE.Mesh;index:number;vertical:boolean;turn?:'straight'|'left'|'right'}[]=[];
   ray=new THREE.Raycaster();pointer=new THREE.Vector2();night=false;debug=false;sun:THREE.DirectionalLight;ambient:THREE.HemisphereLight;
   steeringGuide=new VehicleSteering();
+  observationGuide=new VehicleObservationGuide();
+  observationLinks=new VehicleObservationLinks();
   showDirections=false;directions=new VehicleDirections();blockage=new VehicleBlockage();
   selectedVehicleId:number|null=null;
+  observedVehicleId:number|null=null;
+  observations:VehicleObservations={front:[],rear:[]};
+  private perceptionKey='';
+  private perceptionTime=-Infinity;
+  private observationObstacles:{object:THREE.Object3D;bounds:THREE.Box3}[]=[];
   selectionRing=new THREE.Mesh(new THREE.RingGeometry(.84,1,40).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xffd45c,side:THREE.DoubleSide,toneMapped:false,depthWrite:false}));
   constructor(public canvas:HTMLCanvasElement,public container:HTMLElement){
     this.renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:false});this.renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));this.renderer.shadowMap.enabled=true;this.renderer.shadowMap.type=THREE.PCFSoftShadowMap;this.renderer.setClearColor(0xe8ece4);this.renderer.outputColorSpace=THREE.SRGBColorSpace;this.renderer.toneMapping=THREE.ACESFilmicToneMapping;this.renderer.toneMappingExposure=1.22;
@@ -31,7 +42,7 @@ export class CityScene {
     this.ambient=new THREE.HemisphereLight(0xeaf5ff,0x7e8a69,2.3);this.scene.add(this.ambient);
     this.sun=new THREE.DirectionalLight(0xffeed6,3.5);this.sun.position.set(-75,130,65);this.sun.castShadow=true;this.sun.shadow.mapSize.set(2048,2048);Object.assign(this.sun.shadow.camera,{left:-145,right:145,top:145,bottom:-145,near:1,far:350});this.sun.shadow.bias=-.0005;this.sun.shadow.normalBias=.25;this.scene.add(this.sun);
     this.selectionRing.visible=false;this.selectionRing.renderOrder=5;
-    this.scene.add(this.city,this.cars,this.ghost,this.steeringGuide.group,this.directions.group,this.blockage.group,this.selectionRing);this.resize();new ResizeObserver(()=>this.resize()).observe(container);
+    this.scene.add(this.city,this.cars,this.ghost,this.observationGuide.group,this.observationLinks.group,this.steeringGuide.group,this.directions.group,this.blockage.group,this.selectionRing);this.resize();new ResizeObserver(()=>this.resize()).observe(container);
   }
   resize(){const {width,height}=this.container.getBoundingClientRect();this.renderer.setSize(width,height,false);const aspect=width/height,span=95;this.camera.left=-span*aspect;this.camera.right=span*aspect;this.camera.top=span;this.camera.bottom=-span;this.camera.updateProjectionMatrix();}
   pick(clientX:number,clientY:number){const rect=this.canvas.getBoundingClientRect();this.pointer.set((clientX-rect.left)/rect.width*2-1,-(clientY-rect.top)/rect.height*2+1);this.ray.setFromCamera(this.pointer,this.camera);const p=new THREE.Vector3();return this.ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0),0),p)?pt(p.x,p.z):null;}
@@ -123,6 +134,9 @@ export class CityScene {
 
       }
     });
+    this.city.updateMatrixWorld(true);
+    this.observationObstacles=this.city.children.filter(o=>o instanceof THREE.Mesh||o instanceof THREE.Group)
+      .map(object=>({object,bounds:new THREE.Box3().setFromObject(object)}));
   }
   tree(x:number,z:number,r:number,color:number){this.city.add(cylinder(.2,2.3,0x8b7960,x,1.15,z,6));const crown=new THREE.Mesh(new THREE.IcosahedronGeometry(r,1),mat(color));crown.scale.y=1.35;crown.position.set(x,3+r*.4,z);crown.castShadow=true;this.city.add(crown);}
   drawRoad(road:Road){
@@ -185,6 +199,27 @@ export class CityScene {
       this.selectionRing.scale.set(spec.width/2+.65,1,spec.length/2+.65);
     }
     this.steeringGuide.update(selected);
+    if(selected){
+      const pose=vehicleObservationPose(selected),eye=new THREE.Vector3(pose.x,pose.y,pose.z);
+      const profile=this.observationGuide.profiles[selected.kind],range=Math.max(profile.front.range,profile.rear.range);
+      const solids=this.observationObstacles.filter(o=>o.bounds.distanceToPoint(eye)<=range).map(o=>o.object);
+      this.cars.updateMatrixWorld(true);
+      const targets=sim.vehicles.filter(v=>v.id!==selected.id&&!v.inGarage&&!v.arrived).flatMap(vehicle=>{
+        const object=this.carMeshes.get(vehicle.id);
+        return object&&object.visible&&object.position.distanceTo(eye)<=range+8?[{vehicle,object}]:[];
+      });
+      for(const target of targets)solids.push(target.object);
+      const now=performance.now(),key=JSON.stringify([selected.id,profile]);
+      if(key!==this.perceptionKey||now-this.perceptionTime>=250||now<this.perceptionTime){
+        this.observations=observeVehicles(selected,profile,targets,solids);
+        this.observedVehicleId=selected.id;this.perceptionKey=key;this.perceptionTime=now;
+      }
+      this.observationGuide.update(selected,solids,now);
+    }else{
+      this.observationGuide.update();this.observations={front:[],rear:[]};
+      this.observedVehicleId=null;this.perceptionKey='';
+    }
+    this.observationLinks.update(selected,sim.vehicles,this.observations,this.observedVehicleId);
     this.blockage.update(selected,sim.vehicles);
     this.directions.update(selected?[selected]:sim.vehicles.filter(v=>!v.inGarage),!!selected||this.showDirections);
     this.controls.update();this.renderer.render(this.scene,this.camera);
