@@ -8,6 +8,18 @@ function simulation(vehicles:Vehicle[]){const sim=new Simulation(new World(),()=
 function run(sim:Simulation,seconds:number,check?:(v:Vehicle[])=>void,dt=1/60){for(let i=0;i<seconds/dt;i++){sim.step(dt);for(let a=0;a<sim.vehicles.length;a++)for(let b=a+1;b<sim.vehicles.length;b++){const v=sim.vehicles[a],o=sim.vehicles[b];if(!v.inGarage&&!o.inGarage)assert.equal(overlaps(v.pose,v.kind,o.pose,o.kind,0),false);}check?.(sim.vehicles);}}
 function movement(route:Route,changes:Partial<Movement>={}):Movement {const m:Movement={id:'junction',entry:24,exit:38,stop:24,center:pt(0,0),incoming:route.at(10).angle,outgoing:route.at(45).angle,turn:0,priority:0,control:'none',mode:'priority',circulating:false,enteringRoundabout:false,...changes};route.movements=[m];return m;}
 
+test('a crossing body waiting at red reserves space before the approaching car reaches it',()=>{
+  const lane=road([pt(0,-30),pt(0,50)],3.2),cross=road([pt(-30,0),pt(30,0)],3.2);
+  cross.signals=[{s:30+SPECS.car.length/2+.1,vertical:false,light:{x:0,z:0,offset:0,phases:[{duration:60,horizontal:'red',vertical:'red'}]}}];
+  const a=driver(1,lane,21,'car',4),b=driver(2,cross,30),sim=simulation([a,b]);
+  sim.step();
+  assert.equal(a.state,'yielding');assert.equal(a.blockerId,b.id);
+  assert.match(a.reason??'',/đang trong đường đi/);
+  assert.ok(a.speed<4,'brake before reaching the occupied path');
+  run(sim,3);assert.ok(a.pose.z<-2);assert.notEqual(a.state,'blocked');
+  sim.vehicles=[a];run(sim,3);assert.ok(a.pose.z>0,'resume after the occupied body leaves');
+});
+
 test('a long red queue never reverses or drifts sideways, at 30 and 60 Hz',()=>{
   for(const dt of [1/30,1/60]){
     const lane=road([pt(0,-60),pt(0,100)],3.2);lane.signals=[{s:42,light:{x:0,z:0,offset:0,phases:[{duration:60,horizontal:'red',vertical:'red'}]},vertical:true}];

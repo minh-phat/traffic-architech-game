@@ -71,6 +71,21 @@ export class DrivingSystem {
     return undefined;
   }
 
+  /** A body already across our path keeps its space even when it is waiting
+   * at a signal. Follow the bend and sweep the whole body, not just its centre. */
+  private occupiedPath(v:Vehicle,other:Vehicle){
+    if(Math.cos(other.pose.angle-v.pose.angle)>.8||Math.cos(other.pose.angle-v.pose.angle)<-.8)return undefined;
+    if(overlaps(v.pose,v.kind,other.pose,other.kind,.2))return undefined;
+    const look=this.frontLook(v);
+    let from=v.pose;
+    for(let d=.4;d<=look+.4;d+=.4){
+      const distance=Math.min(d,look),to=v.route.at(Math.min(v.route.total,v.s+distance),v.targetOffset);
+      if(sweptOverlaps(from,to,v.kind,other.pose,other.kind,.35))return Math.max(0,distance-.4);
+      from=to;
+    }
+    return undefined;
+  }
+
   private approachingFront(v:Vehicle,other:Vehicle,c:Conflict,intent:Intent,otherIntent:Intent){
     if(!this.nearFront(v,other)||c.a-v.s>this.frontLook(v)+SPECS[v.kind].length/2)return false;
     const occupied=this.frontObstruction(v,other)!==undefined;
@@ -608,6 +623,13 @@ export class DrivingSystem {
           continue;
         }
         const oi=intents.get(other.id)!;
+        const waitingApproach=intent.movement&&oi.movement?.id===intent.movement.id&&other.s<=oi.movement.entry+.5;
+        const occupied=!waitingApproach&&oi.state==='red-light'
+          ?this.occupiedPath(v,other):undefined;
+        if(occupied!==undefined){
+          this.stop(intent,v,v.s+Math.max(0,occupied-.8),'yielding',`Chừa khoảng trống cho xe #${other.id} đang trong đường đi`,other.id);
+          continue;
+        }
         if((oi.state==='red-light'||oi.state==='stopping'||oi.state==='exit-blocked')&&oi.limit-other.s>1||other.garageYield!==undefined)continue;
         if(oi.state==='red-light'||oi.state==='stopping'||oi.state==='exit-blocked')continue;
         if(!this.nearFront(v,other))continue;
