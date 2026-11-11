@@ -1,3 +1,6 @@
+import { vehicleMotionState } from './vehicle-motion';
+import { pointInObservationSector } from './vehicle-observation';
+import { vehicleObservationPose, vehicleObservationSamples } from './vehicle-perception';
 import { driveArc } from './kinematics';
 import { sweptOverlaps } from './collision';
 import { SPECS, overlaps, dist, project, signalState, planRoute, type Simulation, type Vehicle, type Pose, type Movement, type DrivingState, type Road, type Point } from './simulation';
@@ -82,6 +85,62 @@ export class DrivingSystem {
       const distance=Math.min(d,look),to=v.route.at(Math.min(v.route.total,v.s+distance),v.targetOffset);
       if(sweptOverlaps(from,to,v.kind,other.pose,other.kind,.35))return Math.max(0,distance-.4);
       from=to;
+    }
+    return undefined;
+  }
+
+  private seesFront(v:Vehicle,other:Vehicle,sim:Simulation){
+    const eye=vehicleObservationPose(v),sector=sim.observationProfiles[v.kind].front;
+    return vehicleObservationSamples(other).some(p=>pointInObservationSector(eye,p,sector));
+  }
+
+  /** Predict simultaneous body occupancy, including acceleration when restarting.
+   * Stop half a metre before the first unsafe body position, not its centre. */
+  private crossingRisk(v:Vehicle,other:Vehicle){
+    const speed=Math.max(0,other.velocity??other.speed);
+    if(speed<.3||(other.acceleration??0)<-.5)return undefined;
+    const spec=SPECS[v.kind],step=.1,horizon=5;
+    let previous=v.pose,previousOther=other.pose,previousDistance=0;
+    for(let t=step;t<=horizon;t+=step){
+      const distance=Math.min(v.route.total-v.s,v.speed*t+.5*spec.accel*t*t);
+      const own=v.route.at(v.s+distance,v.targetOffset);
+      const theirs=other.route.at(Math.min(other.route.total,other.s+speed*t),other.targetOffset);
+      // Relative translation sweeps both moving bodies during this interval.
+      const relative={...own,x:own.x-(theirs.x-previousOther.x),
+        y:own.y-(theirs.y-previousOther.y),z:own.z-(theirs.z-previousOther.z)};
+      if(sweptOverlaps(previous,relative,v.kind,previousOther,other.kind,.1)
+        ||overlaps(own,v.kind,theirs,other.kind,.1))return Math.max(v.s,v.s+previousDistance-.5);
+      previous=own;previousOther=theirs;previousDistance=distance;
+    }
+    return undefined;
+  }
+
+  /** A stationary driver must find a clear launch corridor even with priority.
+   * Moving traffic retains its measured speed, including traffic braking now. */
+  private restartBlocker(v:Vehicle,near:Vehicle[],sim:Simulation){
+    if(Math.abs(v.velocity??v.speed)>=.15)return undefined;
+    for(const other of near){
+      if(other===v||!active(other)||other.garageYield===v.id||!this.seesFront(v,other,sim))continue;
+      const speed=other.velocity??other.speed;
+      if(Math.abs(speed)<.15){
+        if(sweptOverlaps(v.pose,v.route.at(Math.min(v.route.total,v.s+.5),v.targetOffset),v.kind,other.pose,other.kind,0))return other;
+        continue;
+      }
+      let previous=v.pose,previousOther=other.pose;
+      const accel=SPECS[v.kind].accel,launchSpeed=2,launchTime=launchSpeed/accel;
+      for(let t=.1;t<=5+.0001;t+=.1){
+        // Accelerate to a modest launch speed; zero current speed alone cannot
+        // tell whether starting into a moving vehicle's path would be safe.
+        const distance=t<launchTime?.5*accel*t*t:.5*accel*launchTime**2+launchSpeed*(t-launchTime);
+        if(distance>this.frontLook(v))break;
+        const own=v.route.at(Math.min(v.route.total,v.s+distance),v.targetOffset);
+        const theirs=this.forecast(other,t);
+        const relative={...own,x:own.x-(theirs.x-previousOther.x),
+          y:own.y-(theirs.y-previousOther.y),z:own.z-(theirs.z-previousOther.z)};
+        if(sweptOverlaps(previous,relative,v.kind,previousOther,other.kind,.25)
+          ||overlaps(own,v.kind,theirs,other.kind,.25))return other;
+        previous=own;previousOther=theirs;
+      }
     }
     return undefined;
   }
@@ -561,7 +620,8 @@ export class DrivingSystem {
     for(const v of vehicles){
       v.age+=dt;v.decision-=dt;
       const x=Math.floor(v.pose.x/12),z=Math.floor(v.pose.z/12),near:Vehicle[]=[];
-      for(let dx=-3;dx<=3;dx++)for(let dz=-3;dz<=3;dz++)near.push(...grid.get(`${x+dx},${z+dz}`)??[]);
+      const radius=Math.max(3,Math.ceil((sim.observationProfiles[v.kind].front.range+6)/12));
+      for(let dx=-radius;dx<=radius;dx++)for(let dz=-radius;dz<=radius;dz++)near.push(...grid.get(`${x+dx},${z+dz}`)??[]);
       neighbors.set(v.id,near);this.departure(v,sim);
       if(v.garageYield!==undefined){
         const arrival=vehicles.find(o=>o.id===v.garageYield);
@@ -624,7 +684,7 @@ export class DrivingSystem {
         }
         const oi=intents.get(other.id)!;
         const waitingApproach=intent.movement&&oi.movement?.id===intent.movement.id&&other.s<=oi.movement.entry+.5;
-        const occupied=!waitingApproach&&oi.state==='red-light'
+        const occupied=!waitingApproach&&(oi.state==='red-light'||v.state==='yielding'&&v.blockerId===other.id)
           ?this.occupiedPath(v,other):undefined;
         if(occupied!==undefined){
           this.stop(intent,v,v.s+Math.max(0,occupied-.8),'yielding',`Chừa khoảng trống cho xe #${other.id} đang trong đường đi`,other.id);
@@ -632,7 +692,14 @@ export class DrivingSystem {
         }
         if((oi.state==='red-light'||oi.state==='stopping'||oi.state==='exit-blocked')&&oi.limit-other.s>1||other.garageYield!==undefined)continue;
         if(oi.state==='red-light'||oi.state==='stopping'||oi.state==='exit-blocked')continue;
-        if(!this.nearFront(v,other))continue;
+        const visible=this.seesFront(v,other,sim);
+        const crossing=visible?this.conflict(v,other,sim.time):null;
+        const predicted=crossing&&!this.hasPriority(v,other,intent,oi,crossing,sim)?this.crossingRisk(v,other):undefined;
+        if(predicted!==undefined){
+          this.stop(intent,v,predicted,'yielding',`Nhường xe #${other.id} đang cắt hướng di chuyển (cách tối thiểu 0,5 m)`,other.id);
+          continue;
+        }
+        if(!visible||!this.nearFront(v,other))continue;
         const c=this.conflict(v,other,sim.time);if(!c||c.a<v.s-spec.length/2||c.b<other.s-SPECS[other.kind].length/2)continue;
         if(!this.approachingFront(v,other,c,intent,oi))continue;
         if(!this.hasPriority(v,other,intent,oi,c,sim)){
@@ -674,6 +741,17 @@ export class DrivingSystem {
       }
       const doorway=vehicles.find(o=>active(o)&&o.garageYield===v.id&&this.frontObstruction(v,o)!==undefined);
       if(doorway){const gap=this.frontObstruction(v,doorway)!;this.stop(intent,v,v.s+Math.max(0,gap-.5),'yielding','Chờ xe trước mặt lùi vào cửa nhà',doorway.id);}
+    }
+    // Check the launch corridor before physical lock detection so a mutual
+    // obstruction still participates in the existing recovery solver.
+    for(const v of vehicles){
+      if(this.reverse.has(v.id)||v.garageYield!==undefined)continue;
+      const blocker=this.restartBlocker(v,neighbors.get(v.id)!,sim);
+      if(blocker){
+        const intent=intents.get(v.id)!;
+        if(intent.state!=='blocked')this.stop(intent,v,v.s,'yielding',`Chờ vùng phía trước an toàn trước khi khởi hành — xe #${blocker.id}`,blocker.id);
+        intent.target=0;
+      }
     }
     // Detect geometric locks separately from normal following or right-of-way.
     for(const v of vehicles){const intent=intents.get(v.id)!,near=neighbors.get(v.id)!;
@@ -780,6 +858,7 @@ export class DrivingSystem {
       if(m&&oldS<m.exit&&v.s>=m.exit)this.grants.delete(v.id);
       if(oldCell!==cell(v.pose)||v.inGarage){grid.set(oldCell,(grid.get(oldCell)??[]).filter(o=>o!==v));if(!v.inGarage)insert(v);}
       if(v.s>=v.route.total-.15){v.arrived=true;sim.completed++;this.reverse.delete(v.id);this.reserved.delete(v.id);this.reverseNeeds.delete(v.id);this.forward.delete(v.id);}
+      v.motionState=vehicleMotionState(v);
       // Replan a sustained blocked trip from a real road position. The new
       // route starts at the exact pose, so neither position nor heading teleports.
       if(((v.stuckTime??0)>20||v.waiting>25&&['following','exit-blocked'].includes(v.state??''))&&sim.time>(v.rerouteAt??0)&&v.route.toHouse!==undefined&&v.leftHouse){

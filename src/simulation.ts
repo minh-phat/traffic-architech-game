@@ -1,3 +1,5 @@
+import type { VehicleMotionState } from './vehicle-motion';
+import { defaultObservationProfiles } from './vehicle-observation';
 import { DrivingSystem } from './driving';
 export type Point = { x: number; y: number; z: number };
 export type DrivingSide = 'right' | 'left';
@@ -136,7 +138,7 @@ type Edge={road:Road;reverse:boolean;start:string;end:string;length:number};
 type WayPoint=Point&{width:number};
 export type Pose=Point&{angle:number};
 export type DrivingState = 'driving' | 'following' | 'red-light' | 'yielding' | 'exit-blocked' | 'stopping' | 'blocked' | 'reversing' | 'garage' | 'merging';
-export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean; state?:DrivingState; reason?:string; blockerId?:number; stuckTime?:number; velocity?:number; acceleration?:number; steering?:number; indicator?:-1|0|1; braking?:boolean; approachSince?:number; approachId?:string; stopTime?:number; stopSince?:number; driverFactor?:number; lane?:number; rerouteAt?:number; tripDistance?:number};
+export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean; state?:DrivingState; motionState?:VehicleMotionState; reason?:string; blockerId?:number; stuckTime?:number; velocity?:number; acceleration?:number; steering?:number; indicator?:-1|0|1; braking?:boolean; approachSince?:number; approachId?:string; stopTime?:number; stopSince?:number; driverFactor?:number; lane?:number; rerouteAt?:number; tripDistance?:number};
 export type Movement = { id:string; entry:number; exit:number; stop:number; center:Point; incoming:number; outgoing:number; incomingRoad?:number; turn:-1|0|1; priority:number; control:'none'|'yield'|'stop'; mode:'priority'|'zipper'|'all-way-stop'; circulating:boolean; enteringRoundabout:boolean; light?:Light };
 export class Route {
   movements:Movement[]=[]; roadIds:number[]=[];
@@ -358,6 +360,7 @@ export function annotateMovements(route:Route,world:World){
   for(let s=route.departureLength;s<route.total-route.arrivalLength;s+=5){const road=world.nearest(route.at(s))?.road;if(road&&!route.roadIds.includes(road.id))route.roadIds.push(road.id);}
 }
 export class Simulation {
+  observationProfiles=defaultObservationProfiles();
   vehicles:Vehicle[]=[];time=0;completed=0;nextId=1;target=50;spawnClock=0;paused=false;types:Record<VehicleKind,boolean>={bike:true,car:true,truck:true};
   private driving=new DrivingSystem();
   // Keep consumed random values so restoring a checkpoint also restores the
@@ -374,11 +377,12 @@ export class Simulation {
   reset(){this.randomValues=[];this.randomCursor=0;this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.driving=new DrivingSystem();}
   snapshot(){
     return {randomCursor:this.randomCursor,time:this.time,completed:this.completed,nextId:this.nextId,spawnClock:this.spawnClock,
-      target:this.target,types:{...this.types},driving:this.driving.snapshot(),
+      observationProfiles:structuredClone(this.observationProfiles),target:this.target,types:{...this.types},driving:this.driving.snapshot(),
       vehicles:this.vehicles.map(({route,...state})=>({...structuredClone(state),route}))};
   }
   restore(snapshot:ReturnType<Simulation['snapshot']>){
     this.randomCursor=snapshot.randomCursor;
+    Object.assign(this.observationProfiles,structuredClone(snapshot.observationProfiles));
     this.time=snapshot.time;this.completed=snapshot.completed;this.nextId=snapshot.nextId;
     this.spawnClock=snapshot.spawnClock;this.target=snapshot.target;this.types={...snapshot.types};
     this.vehicles=snapshot.vehicles.map(({route,...state})=>({...structuredClone(state),route}));
