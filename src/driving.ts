@@ -1,6 +1,4 @@
 import { vehicleMotionState } from './vehicle-motion';
-import { pointInObservationSector } from './vehicle-observation';
-import { vehicleObservationPose, vehicleObservationSamples } from './vehicle-perception';
 import { driveArc } from './kinematics';
 import { sweptOverlaps } from './collision';
 import { SPECS, overlaps, dist, project, signalState, planRoute, type Simulation, type Vehicle, type Pose, type Movement, type DrivingState, type Road, type Point } from './simulation';
@@ -30,15 +28,16 @@ export class DrivingSystem {
   private tick=0;
   private surfaces=new Map<string,{a:Point;b:Point;road:Road}[]>();
   private surfaceReady=false;
+  private stoppedPaths=new Map<number,{key:string;steps:{pose:Pose;s:number}[]}>();
 
   snapshot(){
-    const {surfaces, surfaceReady, ...state}=this;
+    const {surfaces, surfaceReady, stoppedPaths, ...state}=this;
     return structuredClone(state);
   }
 
   restore(state:ReturnType<DrivingSystem['snapshot']>){
     Object.assign(this,structuredClone(state));
-    this.surfaces.clear();this.surfaceReady=false;
+    this.surfaces.clear();this.surfaceReady=false;this.stoppedPaths.clear();
   }
 
   roadDelay(sim:Simulation){
@@ -89,9 +88,36 @@ export class DrivingSystem {
     return undefined;
   }
 
+  /** A stopped body owns its space regardless of junction priority. Follow
+   * the actual steering transition, sweeping the whole body along the corridor. */
+  private stoppedPathObstruction(v:Vehicle,other:Vehicle){
+    if(Math.abs(other.velocity??other.speed)>=.15||overlaps(v.pose,v.kind,other.pose,other.kind,0))return undefined;
+    const look=this.frontLook(v),speed=Math.max(1,v.speed);
+    const own=SPECS[v.kind],body=SPECS[other.kind];
+    const reach=look+Math.hypot(own.length,own.width)/2+Math.hypot(body.length,body.width)/2+.1;
+    if(dist(v.pose,other.pose)>reach)return undefined;
+    const steering=this.forward.get(v.id)?.steering;
+    const key=[v.s,v.pose.x,v.pose.y,v.pose.z,v.pose.angle,v.speed,v.steering,v.targetOffset,steering].join(',');
+    let path=this.stoppedPaths.get(v.id);
+    if(path?.key!==key){
+      const steps:{pose:Pose;s:number}[]=[];
+      let probe={...v};
+      for(let d=0;d<look;d+=.25){
+        const travel=Math.min(.25,look-d),next=this.motion(probe,travel,v.targetOffset,travel/speed,steering);
+        steps.push(next);probe={...probe,...next};
+      }
+      path={key,steps};this.stoppedPaths.set(v.id,path);
+    }
+    let previous={pose:v.pose,s:v.s};
+    for(const next of path.steps){
+      if(sweptOverlaps(previous.pose,next.pose,v.kind,other.pose,other.kind,.06))return Math.max(v.s,previous.s);
+      previous=next;
+    }
+    return undefined;
+  }
+
   private seesFront(v:Vehicle,other:Vehicle,sim:Simulation){
-    const eye=vehicleObservationPose(v),sector=sim.observationProfiles[v.kind].front;
-    return vehicleObservationSamples(other).some(p=>pointInObservationSector(eye,p,sector));
+    return sim.observations.get(v.id)?.front.some(target=>target.id===other.id)??false;
   }
 
   /** Predict simultaneous body occupancy, including acceleration when restarting.
@@ -605,7 +631,7 @@ export class DrivingSystem {
   }
 
   step(sim:Simulation,dt:number){
-    this.tick++;
+    this.tick++;this.stoppedPaths.clear();
     const vehicles=sim.vehicles.filter(active),grid=new Map<string,Vehicle[]>();
     const cell=(p:Pose)=>`${Math.floor(p.x/12)},${Math.floor(p.z/12)}`;
     const insert=(v:Vehicle)=>{const k=cell(v.pose);const bucket=grid.get(k)??[];bucket.push(v);grid.set(k,bucket);};vehicles.forEach(insert);
@@ -616,11 +642,12 @@ export class DrivingSystem {
       if(sim.vehicles.some(o=>active(o)&&overlaps(v.route.at(0),v.kind,o.pose,o.kind,.4)))continue;
       v.inGarage=false;v.garageYield=undefined;v.pose=v.route.at(0);v.speed=0;v.velocity=0;v.steering=0;vehicles.push(v);insert(v);
     }
+    sim.refreshObservations();
     const neighbors=new Map<number,Vehicle[]>(),intents=new Map<number,Intent>();
     for(const v of vehicles){
       v.age+=dt;v.decision-=dt;
       const x=Math.floor(v.pose.x/12),z=Math.floor(v.pose.z/12),near:Vehicle[]=[];
-      const radius=Math.max(3,Math.ceil((sim.observationProfiles[v.kind].front.range+6)/12));
+      const radius=Math.max(3,Math.ceil((Math.max(sim.observationProfiles[v.kind].front.range,sim.observationProfiles[v.kind].rear.range)+6)/12));
       for(let dx=-radius;dx<=radius;dx++)for(let dz=-radius;dz<=radius;dz++)near.push(...grid.get(`${x+dx},${z+dz}`)??[]);
       neighbors.set(v.id,near);this.departure(v,sim);
       if(v.garageYield!==undefined){
@@ -663,11 +690,11 @@ export class DrivingSystem {
         const p=v.route.at(v.s),dx=other.pose.x-v.pose.x,dz=other.pose.z-v.pose.z;
         const along=dx*Math.sin(p.angle)+dz*Math.cos(p.angle),across=Math.abs(dx*Math.cos(p.angle)-dz*Math.sin(p.angle));
         const sameDirection=Math.cos(other.pose.angle-p.angle)>.8;
-        if(sameDirection&&across>=(spec.width+SPECS[other.kind].width)/2+.15)continue;
-        if(sameDirection&&along>(spec.length+SPECS[other.kind].length)/2-.1&&across<(spec.width+SPECS[other.kind].width)/2+.25){
+        if(this.seesFront(v,other,sim)&&sameDirection&&along>(spec.length+SPECS[other.kind].length)/2-.1&&across<(spec.width+SPECS[other.kind].width)/2+.25){
           const planned=v.route.at(v.s+Math.max(4,along),v.targetOffset);
           const plannedAcross=Math.abs((other.pose.x-planned.x)*Math.cos(p.angle)-(other.pose.z-planned.z)*Math.sin(p.angle));
-          if(plannedAcross>(spec.width+SPECS[other.kind].width)/2+.25)continue;
+          // A future lane offset does not make the steering transition clear.
+          if(plannedAcross>(spec.width+SPECS[other.kind].width)/2+.25&&this.stoppedPathObstruction(v,other)===undefined)continue;
           const gap=along-(spec.length+SPECS[other.kind].length)/2;
           const relative=v.speed-Math.max(0,other.velocity??other.speed),headway=spec.headway/(v.driverFactor??1);
           const desiredGap=.9+Math.max(0,v.speed*headway+v.speed*relative/(2*Math.sqrt(spec.accel*spec.brake)));
@@ -690,6 +717,12 @@ export class DrivingSystem {
           this.stop(intent,v,v.s+Math.max(0,occupied-.8),'yielding',`Chừa khoảng trống cho xe #${other.id} đang trong đường đi`,other.id);
           continue;
         }
+        const obstruction=this.seesFront(v,other,sim)?this.stoppedPathObstruction(v,other):undefined;
+        if(obstruction!==undefined){
+          this.stop(intent,v,obstruction,'blocked',`Xe #${other.id} đang chắn cung di chuyển phía trước`,other.id);
+          continue;
+        }
+        if(sameDirection&&across>=(spec.width+SPECS[other.kind].width)/2+.15)continue;
         if((oi.state==='red-light'||oi.state==='stopping'||oi.state==='exit-blocked')&&oi.limit-other.s>1||other.garageYield!==undefined)continue;
         if(oi.state==='red-light'||oi.state==='stopping'||oi.state==='exit-blocked')continue;
         const visible=this.seesFront(v,other,sim);

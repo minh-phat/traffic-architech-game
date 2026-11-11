@@ -5,7 +5,7 @@ import { VehicleBlockage } from './vehicle-blockage';
 import { VehicleDirections } from './vehicle-directions';
 import { VehicleObservationGuide } from './vehicle-observation-guide';
 import { VehicleObservationLinks } from './vehicle-observation-links';
-import { observeVehicles, vehicleObservationPose, type VehicleObservations } from './vehicle-perception';
+import { observeInContext, vehicleObservationPose, type ObservationContext, type VehicleObservations } from './vehicle-perception';
 import { World, Simulation, SPECS, type Point, type Vehicle, type Road, type Pose, signalState, pt, dist } from './simulation';
 
 const materials=new Map<string,THREE.MeshStandardMaterial>();
@@ -174,7 +174,7 @@ export class CityScene {
     }
     const wire=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(s.width+.16,2.1,s.length+.16)),new THREE.LineBasicMaterial({color:0xecae46}));(wire.material as THREE.Material).userData.transient=true;wire.position.y=1.1;wire.name='collision';wire.visible=this.debug;g.add(wire);g.traverse(o=>{if(o instanceof THREE.Mesh)o.castShadow=true;});this.cars.add(g);this.carMeshes.set(v.id,g);return g;
   }
-  update(sim:Simulation,alpha=1){
+  private syncVehicles(sim:Simulation,alpha=1){
     const ids=new Set(sim.vehicles.map(v=>v.id));for(const [id,g]of this.carMeshes)if(!ids.has(id)){dispose(g);this.cars.remove(g);this.carMeshes.delete(id);}
     for(const v of sim.vehicles){const g=this.carMeshes.get(v.id)??this.makeVehicle(v);const old=g.userData.pose as Pose|undefined,p=v.pose;
       g.visible=!v.inGarage;const blend=old?alpha:1;g.position.lerp(new THREE.Vector3(p.x,p.y+.12,p.z),blend);let angle=p.angle-g.rotation.y;angle=Math.atan2(Math.sin(angle),Math.cos(angle));g.rotation.y+=angle*blend;g.userData.pose=p;g.getObjectByName('collision')!.visible=this.debug;
@@ -188,6 +188,18 @@ export class CityScene {
       g.rotation.z=v.kind==='bike'?THREE.MathUtils.clamp(-((v.velocity??0)**2)*Math.tan(v.steering??0)/(SPECS.bike.wheelbase*9.81),-.28,.28):0;
       const next=v.route.at(Math.min(v.route.total,v.s+.8)),prev=v.route.at(Math.max(0,v.s-.8));g.rotation.x=Math.atan2(next.y-prev.y,dist(prev,next)||1)*-.8;
     }
+  }
+  /** Synchronize from simulation poses before any decision, independent of selection. */
+  prepareObservation(sim:Simulation):ObservationContext {
+    this.syncVehicles(sim);
+    this.cars.updateMatrixWorld(true);
+    const targets=sim.vehicles.filter(v=>!v.inGarage&&!v.arrived).map(vehicle=>({vehicle,object:this.carMeshes.get(vehicle.id)!}));
+    const bounds=new Map(this.observationObstacles.map(o=>[o.object,o.bounds] as [THREE.Object3D,THREE.Box3]));
+    for(const {object} of targets)bounds.set(object,new THREE.Box3().setFromObject(object));
+    return {targets,bounds,occluders:[...bounds.keys()]};
+  }
+  update(sim:Simulation,alpha=1){
+    this.syncVehicles(sim,alpha);
     for(const signal of this.signalMeshes){const light=sim.world.lights[signal.index];if(light){const state=signalState(sim.time,light,signal.vertical,signal.turn);const m=signal.mesh.material as THREE.MeshStandardMaterial;m.color.setHex(state==='green'?0x7cda8a:state==='yellow'?0xffc34b:0xf26352);m.emissive.copy(m.color);}}
     const selected=sim.vehicles.find(v=>v.id===this.selectedVehicleId&&!v.inGarage);
     if(!selected)this.selectedVehicleId=null;
@@ -211,7 +223,7 @@ export class CityScene {
       for(const target of targets)solids.push(target.object);
       const now=performance.now(),key=JSON.stringify([selected.id,profile]);
       if(key!==this.perceptionKey||now-this.perceptionTime>=250||now<this.perceptionTime){
-        this.observations=observeVehicles(selected,profile,targets,solids);
+        this.observations=observeInContext(selected,profile,{targets,occluders:solids});
         this.observedVehicleId=selected.id;this.perceptionKey=key;this.perceptionTime=now;
       }
       this.observationGuide.update(selected,solids,now);

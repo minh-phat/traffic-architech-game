@@ -5,10 +5,24 @@ import { Simulation, World, Route, sampled, pt, type Vehicle } from '../src/simu
 
 const route=(points:ReturnType<typeof pt>[])=>new Route(sampled(points).map(p=>({...p,width:3.2})),[]);
 const vehicle=(id:number,r:Route,s:number,speed:number):Vehicle=>({id,route:r,s,kind:'car',speed,offset:0,targetOffset:0,pose:r.at(s),waiting:0,age:0,arrived:false,blocked:false,decision:0});
-const system=()=>new DrivingSystem() as unknown as {
+type TestSystem={
   crossingRisk(a:Vehicle,b:Vehicle):number|undefined;
   seesFront(a:Vehicle,b:Vehicle,sim:Simulation):boolean;
   restartBlocker(a:Vehicle,near:Vehicle[],sim:Simulation):Vehicle|undefined;
+};
+const system=()=>{
+  const driving=new DrivingSystem() as unknown as TestSystem;
+  return {
+    crossingRisk:driving.crossingRisk.bind(driving),
+    seesFront(a:Vehicle,b:Vehicle,sim:Simulation){
+      sim.vehicles=[a,b];sim.refreshObservations();
+      return driving.seesFront(a,b,sim);
+    },
+    restartBlocker(a:Vehicle,near:Vehicle[],sim:Simulation){
+      sim.vehicles=[a,...near.filter(v=>v!==a)];sim.refreshObservations();
+      return driving.restartBlocker(a,near,sim);
+    },
+  };
 };
 
 test('crossing prediction reserves half a metre before unsafe body occupancy',()=>{

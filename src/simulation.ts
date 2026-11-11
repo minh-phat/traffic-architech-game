@@ -1,3 +1,4 @@
+import { observationContext, observeInContext, type ObservationContext, type VehicleObservations } from './vehicle-perception';
 import type { VehicleMotionState } from './vehicle-motion';
 import { defaultObservationProfiles } from './vehicle-observation';
 import { DrivingSystem } from './driving';
@@ -361,6 +362,14 @@ export function annotateMovements(route:Route,world:World){
 }
 export class Simulation {
   observationProfiles=defaultObservationProfiles();
+  prepareObservation?: (sim:Simulation)=>ObservationContext;
+  observations=new Map<number,VehicleObservations>();
+  refreshObservations(){
+    const context=this.prepareObservation?.(this)??observationContext(this.vehicles);
+    this.observations.clear();
+    for(const v of this.vehicles)if(!v.arrived&&!v.inGarage)
+      this.observations.set(v.id,observeInContext(v,this.observationProfiles[v.kind],context));
+  }
   vehicles:Vehicle[]=[];time=0;completed=0;nextId=1;target=50;spawnClock=0;paused=false;types:Record<VehicleKind,boolean>={bike:true,car:true,truck:true};
   private driving=new DrivingSystem();
   // Keep consumed random values so restoring a checkpoint also restores the
@@ -374,7 +383,7 @@ export class Simulation {
       return this.randomValues[this.randomCursor++];
     };
   }
-  reset(){this.randomValues=[];this.randomCursor=0;this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.driving=new DrivingSystem();}
+  reset(){this.randomValues=[];this.randomCursor=0;this.vehicles=[];this.time=0;this.completed=0;this.spawnClock=0;this.driving=new DrivingSystem();this.observations.clear();}
   snapshot(){
     return {randomCursor:this.randomCursor,time:this.time,completed:this.completed,nextId:this.nextId,spawnClock:this.spawnClock,
       observationProfiles:structuredClone(this.observationProfiles),target:this.target,types:{...this.types},driving:this.driving.snapshot(),
@@ -385,6 +394,7 @@ export class Simulation {
     Object.assign(this.observationProfiles,structuredClone(snapshot.observationProfiles));
     this.time=snapshot.time;this.completed=snapshot.completed;this.nextId=snapshot.nextId;
     this.spawnClock=snapshot.spawnClock;this.target=snapshot.target;this.types={...snapshot.types};
+    this.observations.clear();
     this.vehicles=snapshot.vehicles.map(({route,...state})=>({...structuredClone(state),route}));
     this.driving=new DrivingSystem();this.driving.restore(snapshot.driving);
   }

@@ -4,6 +4,7 @@ import { isObservationPointVisible, type ObservationPose, type ObservationProfil
 
 export type ObservedVehicle = { id:number; kind:VehicleKind; distance:number; sampleIndex:number };
 export type VehicleObservations = { front:ObservedVehicle[]; rear:ObservedVehicle[] };
+export type ObservationContext = { targets:ObservationTarget[]; occluders:THREE.Object3D[]; bounds?:Map<THREE.Object3D,THREE.Box3> };
 export type ObservationTarget = { vehicle:Vehicle; object:THREE.Object3D };
 
 /** Eye height and road pitch are shared by the display and detection. */
@@ -48,4 +49,18 @@ export function observeVehicles(observer:Vehicle,profile:ObservationProfile,targ
   result.front.sort((a,b)=>a.distance-b.distance||a.id-b.id);
   result.rear.sort((a,b)=>a.distance-b.distance||a.id-b.id);
   return result;
+}
+
+/** Headless callers can supply their own geometry; without a scene only sector
+ * coverage is available. The interactive app supplies its actual rendered meshes. */
+export function observationContext(vehicles:Vehicle[]):ObservationContext {
+  return {targets:vehicles.filter(v=>!v.arrived&&!v.inGarage).map(vehicle=>({vehicle,object:new THREE.Group()})),occluders:[]};
+}
+
+export function observeInContext(observer:Vehicle,profile:ObservationProfile,context:ObservationContext):VehicleObservations {
+  const own=context.targets.find(t=>t.vehicle.id===observer.id)?.object;
+  const pose=vehicleObservationPose(observer),eye=new THREE.Vector3(pose.x,pose.y,pose.z);
+  const range=Math.max(profile.front.range,profile.rear.range);
+  const occluders=context.occluders.filter(o=>o!==own&&(!context.bounds?.has(o)||context.bounds.get(o)!.distanceToPoint(eye)<=range));
+  return observeVehicles(observer,profile,context.targets,occluders);
 }

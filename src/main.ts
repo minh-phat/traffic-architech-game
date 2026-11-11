@@ -34,6 +34,7 @@ createIcons({icons});
 const $=<T extends HTMLElement=HTMLElement>(id:string)=>document.getElementById(id) as T;
 let world:World=demoWorld(),sim=new Simulation(world);const timeline=new Timeline(sim);let scene:CityScene;
 try{scene=new CityScene($<HTMLCanvasElement>('city-canvas'),document.querySelector('.viewport')!);}catch(e){$('loading').innerHTML='<strong>Không khởi tạo được đồ họa 3D.</strong><p>Hãy bật tăng tốc phần cứng hoặc mở bằng Chrome / Edge mới.</p>';throw e;}
+sim.prepareObservation=simulation=>scene.prepareObservation(simulation);
 scene.rebuild(world);$('loading').hidden=true;
 scene.setCameraInteraction(true,true);
 const observationStorageKey='pho-flow-observation-v1';

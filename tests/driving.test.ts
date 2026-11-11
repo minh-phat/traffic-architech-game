@@ -250,5 +250,6 @@ test('a departure approaches a clear merge instead of stopping at the door for d
   const driveway=road([pt(0,0),pt(0,30)],3.6),street=road([pt(-30,10),pt(30,10)]);driveway.fromHouse=1;driveway.departureLength=10;
   const leaving=driver(1,driveway,0,'car',6),through=driver(2,street,14,'car',8),sim=simulation([leaving,through]);sim.step();
   assert.notEqual(leaving.state,'merging');assert.ok(leaving.speed>=6);assert.ok(leaving.s>.09);assert.ok(through.speed>=8);
-  run(sim,15);assert.equal(sim.completed,2);
+  // Allow the additional stop for an occupied corridor before both trips clear.
+  run(sim,20);assert.equal(sim.completed,2);
 });
