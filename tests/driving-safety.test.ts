@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Simulation, World, Route, SPECS, pt, sampled, type Vehicle } from '../src/simulation';
 import { penetration, separatesContact } from '../src/collision';
 import { YieldPrediction } from '../src/vehicle-yield-prediction';
+import { DrivingSystem } from '../src/driving';
 
 const road=(a=pt(0,0),b=pt(0,100),width=3.2)=>new Route(sampled([a,b]).map(p=>({...p,width})),[]);
 const car=(id:number,route:Route,s:number,speed=0):Vehicle=>({id,kind:'car',route,s,speed,pose:route.at(s),offset:0,targetOffset:0,waiting:0,age:0,arrived:false,blocked:false,decision:10});
@@ -103,4 +104,31 @@ test('a stationary crossing obstruction gets a stopping buffer before body conta
   for(let i=0;i<180;i++)sim.step();
   const gap=b.pose.z-SPECS.car.width/2-a.pose.z-SPECS.car.length/2;
   assert.ok(gap>=1.4,`leave room before crossing body: ${gap}`);
+});
+
+test('a recovery can use a reserved rear gap while retaining clearance for the stopped follower',()=>{
+  const lane=road(),a=car(1,lane,20),follower=car(2,lane,14.4);
+  follower.kind='bike';
+  const sim=simulation([a,follower]);
+  const driving=new DrivingSystem() as unknown as {
+    reverseChoices(v:Vehicle,near:Vehicle[],sim:Simulation,max:number):{steering:number;room:number}[];
+  };
+  const straight=driving.reverseChoices(a,[follower],sim,4).find(c=>c.steering===0);
+  assert.ok(straight&&straight.room>.5,'a follower with spare room must not prohibit every retreat');
+  const gap=a.s-straight.room-follower.s-(SPECS.car.length+SPECS.bike.length)/2;
+  assert.ok(gap>=.9-1e-8,'keep the follower buffer throughout the retreat');
+  follower.s=16;follower.pose=lane.at(follower.s);
+  const close=driving.reverseChoices(a,[follower],sim,4).find(c=>c.steering===0);
+  assert.ok(!close||close.room<.2,'a close follower still prevents reversing into its space');
+});
+
+test('a short recovery arc is rejected when approaching traffic will occupy its stopping space',()=>{
+  const a=car(1,road(),10),b=car(2,road(pt(0,40),pt(0,0)),23,2);
+  const sim=simulation([a,b]);
+  const driving=new DrivingSystem() as unknown as {
+    forwardChoices(v:Vehicle,near:Vehicle[],sim:Simulation):{steering:number}[];
+  };
+  assert.equal(driving.forwardChoices(a,[b],sim).some(c=>c.steering===0),false);
+  b.speed=0;
+  assert.ok(driving.forwardChoices(a,[b],sim).some(c=>c.steering===0),'a genuinely clear stopping space still allows recovery');
 });
