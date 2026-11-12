@@ -97,8 +97,15 @@ export class YieldPrediction {
       const halfBody=Math.max(spec.width,...observed.filter(o=>!o.arrived&&!o.inGarage).map(o=>SPECS[o.kind].width))/2;
       const targetOffset=offset??Math.sign(steering)*Math.min(bound,spec.width/2+halfBody+YIELD_BUFFER+.7);
       // Include a full braking tail: a detour must end somewhere it can stop.
-      const horizon=HORIZON+Math.ceil(speed/spec.brake/STEP)*STEP+.2;
-      const path=forecast({...vehicle,targetOffset},'route',speed,Infinity,limit,steering,duration,horizon,HORIZON,spec.brake);
+      // Look beyond the nearest stationary blocker, including its tail.
+      // A long truck can occupy more than the old three-second preview.
+      const blockers=observed.filter(o=>o.id!==vehicle.id&&!o.arrived&&!o.inGarage&&Math.abs(o.velocity??o.speed)<.3)
+        .map(o=>({o,along:(o.pose.x-vehicle.pose.x)*Math.sin(vehicle.pose.angle)+(o.pose.z-vehicle.pose.z)*Math.cos(vehicle.pose.angle)}))
+        .filter(({along})=>along>0&&along<12);
+      const clearance=blockers.length?Math.min(...blockers.map(({o,along})=>along+(spec.length+SPECS[o.kind].length)/2+YIELD_BUFFER)):0;
+      const driveTime=Math.max(HORIZON,Math.min(6,clearance/Math.max(.5,speed)+speed/spec.accel));
+      const horizon=driveTime+Math.ceil(speed/spec.brake/STEP)*STEP+.2;
+      const path=forecast({...vehicle,targetOffset},'route',speed,Infinity,limit,steering,duration,horizon,driveTime,spec.brake);
       const end=path.at(-1)!;
       if(end.s-vehicle.s<1||end.distance<1.5)continue;
       let probe={...vehicle},clear=true;

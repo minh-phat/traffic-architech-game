@@ -469,7 +469,13 @@ export class DrivingSystem {
   private reverseChoices(v:Vehicle,near:Vehicle[],sim:Simulation,max:number){
     const spec=SPECS[v.kind],steers=[v.steering??0,0,-spec.maxSteer/2,spec.maxSteer/2,-spec.maxSteer,spec.maxSteer];
     return steers.map(steering=>{
-      const reserved=this.rearRoom(v,near,max,steering);let room=0,probe={...v,steering};
+      // Keep the working gap of a stopped follower available to that
+      // follower; it is not automatically permission to reverse into its queue.
+      const queuedBehind=near.some(o=>o.id!==v.id&&active(o)&&Math.abs(o.velocity??o.speed)<.3
+        &&Math.cos(o.pose.angle-v.pose.angle)>.8
+        &&(o.pose.x-v.pose.x)*Math.sin(v.pose.angle)+(o.pose.z-v.pose.z)*Math.cos(v.pose.angle)<0
+        &&sweptOverlaps(v.pose,driveArc(v.pose,-2.5,0,spec.wheelbase),v.kind,o.pose,o.kind,.1));
+      const reserved=queuedBehind?0:this.rearRoom(v,near,max,steering);let room=0,probe={...v,steering};
       const others=near.filter(o=>o.id!==v.id);
       while(room<reserved-.001){
         const step=Math.min(.1,reserved-room),next=this.motion(probe,-step,0,step/.9,steering);
@@ -720,7 +726,11 @@ export class DrivingSystem {
           if(plannedAcross>(spec.width+SPECS[other.kind].width)/2+.25&&this.stoppedPathObstruction(v,other)===undefined)continue;
           const gap=along-(spec.length+SPECS[other.kind].length)/2;
           const relative=v.speed-Math.max(0,other.velocity??other.speed),headway=spec.headway/(v.driverFactor??1);
-          const desiredGap=.9+Math.max(0,v.speed*headway+v.speed*relative/(2*Math.sqrt(spec.accel*spec.brake)));
+          // Leave working room behind a stalled/recovering queue. Closing to
+          // bumper distance prevents the leader from opening its turning arc.
+          const working=other.blocked||['blocked','reversing','yielding','exit-blocked'].includes(other.state??'');
+          const standstillGap=working?2.5:.9;
+          const desiredGap=standstillGap+Math.max(0,v.speed*headway+v.speed*relative/(2*Math.sqrt(spec.accel*spec.brake)));
           const acceleration=spec.accel*(1-(v.speed/Math.max(.1,intent.target))**4-(desiredGap/Math.max(.15,gap))**2);
           intent.target=Math.min(intent.target,Math.max(0,v.speed+acceleration*dt));
           if(gap<leaderGap){
@@ -728,6 +738,8 @@ export class DrivingSystem {
             if(intent.state==='driving'||intent.state==='following'){intent.state='following';intent.reason=`Giữ khoảng cách với xe #${other.id}`;intent.other=other.id;intent.legal=true;}
           }
           // A stopped lead vehicle's legal reason propagates down the queue.
+          if(working&&Math.abs(other.velocity??other.speed)<.3)
+            this.stop(intent,v,v.s+Math.max(0,gap-standstillGap),'following',`Chừa khoảng trống sau xe #${other.id}`,other.id);
           const oi=intents.get(other.id)!;
           if(gap<2&&oi.legal){intent.legal=true;}
           continue;
@@ -742,7 +754,7 @@ export class DrivingSystem {
         }
         const obstruction=this.seesFront(v,other,sim)?this.stoppedPathObstruction(v,other):undefined;
         if(obstruction!==undefined){
-          this.stop(intent,v,obstruction,'blocked',`Xe #${other.id} đang chắn cung di chuyển phía trước`,other.id);
+          this.stop(intent,v,Math.max(v.s,obstruction-1.5),'blocked',`Xe #${other.id} đang chắn cung di chuyển phía trước`,other.id);
           continue;
         }
         if(sameDirection&&across>=(spec.width+SPECS[other.kind].width)/2+.15)continue;

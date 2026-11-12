@@ -84,3 +84,23 @@ test('a driver limits speed so it can stop within a shortened observation range'
   assert.ok(v.speed>0);assert.ok(v.speed<SPECS.car.speed*.6);
   assert.ok(v.speed*.35+v.speed*v.speed/(2*SPECS.car.brake)<=5-SPECS.car.length/2-.5+1e-6);
 });
+
+test('a follower leaves working room behind a blocked leader and resumes when it clears',()=>{
+  const lane=road(),a=car(1,lane,10),b=car(2,lane,17);
+  b.state='blocked';b.blocked=true;
+  const sim=simulation([a,b]);
+  sim.step();
+  assert.ok(a.speed<.1,'do not accelerate into the leader manoeuvring space');
+  assert.ok(b.s-a.s-SPECS.car.length>=2.5);
+  sim.vehicles=[a];sim.step();
+  assert.ok(a.speed>0,'release the working gap once the blocker leaves');
+});
+
+test('a stationary crossing obstruction gets a stopping buffer before body contact',()=>{
+  const a=car(1,road(),10,2),b=car(2,road(pt(-30,17),pt(30,17)),30);
+  b.route.signals=[{s:b.s+SPECS.car.length/2,vertical:true,light:{x:0,z:17,offset:0,phases:[{duration:60,horizontal:'red',vertical:'red'}]}}];
+  const sim=simulation([a,b]);
+  for(let i=0;i<180;i++)sim.step();
+  const gap=b.pose.z-SPECS.car.width/2-a.pose.z-SPECS.car.length/2;
+  assert.ok(gap>=1.4,`leave room before crossing body: ${gap}`);
+});
