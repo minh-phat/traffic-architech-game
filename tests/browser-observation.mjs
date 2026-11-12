@@ -40,6 +40,14 @@ try{
   await page.waitForFunction(()=>window.__PHO_FLOW__.snapshot().observationVisible);
   assert.equal(await page.locator('#observation-kind').inputValue(),selected.kind);
   await page.waitForFunction(id=>window.__PHO_FLOW__.snapshot().observedVehicleId===id,selected.id);
+  const yieldingTo=await page.evaluate(id=>{
+    const vehicles=window.__PHO_FLOW__.simulation.vehicles,observer=vehicles.find(v=>v.id===id);
+    observer.yieldingTo=vehicles.filter(v=>v.id!==id).slice(0,2).map(v=>v.id);
+    observer.reason=`Nhường xe #${observer.yieldingTo[0]}`;
+    return observer.yieldingTo;
+  },selected.id);
+  await page.waitForFunction(ids=>document.getElementById('vehicle-details').textContent.includes(`Các xe cần nhường: ${ids.map(id=>`#${id}`).join(', ')}`),yieldingTo);
+
   // Place two paused vehicles in open 3D space so the detection and marker
   // can be checked without depending on the randomly spawned city traffic.
   const targetId=await page.evaluate(id=>{
@@ -68,5 +76,5 @@ try{
   await page.selectOption('#observation-kind','bike');await page.click('#observation-reset');
   assert.equal(await page.locator('#observation-front-range').inputValue(),'18');
   assert.deepEqual(errors,[]);
-  console.log('Observation UI passed: type settings, persistence, selection, visibility and reset.');
+  console.log('Observation UI passed: type settings, persistence, selection, multiple yield targets, visibility and reset.');
 }finally{await browser.close();}

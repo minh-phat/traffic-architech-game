@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {pt,overlaps} from '../src/simulation';
-import {sweptOverlaps} from '../src/collision';
+import {sweptOverlaps,movingBodiesOverlap} from '../src/collision';
+import {driveArc} from '../src/kinematics';
+
+test('a rotating truck passing a nearby corner is not trapped by the padded prediction envelope',()=>{
+  const start={x:-25.443974624294523,y:0,z:38.72402474285062,angle:-1.6064368514463612};
+  const other={x:-28.506048236591848,y:0,z:41.46763567409141,angle:.9608585552776239};
+  const from=driveArc(start,.5775,-.35,3.7),to=driveArc(from,.1155,-.35,3.7);
+  assert.equal(sweptOverlaps(from,to,'truck',other,'car',.06),false);
+  assert.equal(movingBodiesOverlap(from,to,'truck',other,other,'car',.06),false);
+});
 
 test('continuous movement catches a vehicle between two clear endpoints',()=>{
   const a={...pt(-6,0),angle:Math.PI/2},b={...pt(6,0),angle:Math.PI/2},other={...pt(0,0),angle:0};

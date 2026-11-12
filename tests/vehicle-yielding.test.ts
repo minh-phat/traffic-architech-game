@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { YieldPrediction } from '../src/vehicle-yield-prediction';
 import { DrivingSystem } from '../src/driving';
 import { Simulation, World, Route, sampled, pt, type Vehicle } from '../src/simulation';
 
@@ -8,7 +9,6 @@ const vehicle=(id:number,r:Route,s:number,speed:number):Vehicle=>({id,route:r,s,
 type TestSystem={
   crossingRisk(a:Vehicle,b:Vehicle):number|undefined;
   seesFront(a:Vehicle,b:Vehicle,sim:Simulation):boolean;
-  restartBlocker(a:Vehicle,near:Vehicle[],sim:Simulation):Vehicle|undefined;
 };
 const system=()=>{
   const driving=new DrivingSystem() as unknown as TestSystem;
@@ -18,12 +18,14 @@ const system=()=>{
       sim.vehicles=[a,b];sim.refreshObservations();
       return driving.seesFront(a,b,sim);
     },
-    restartBlocker(a:Vehicle,near:Vehicle[],sim:Simulation){
-      sim.vehicles=[a,...near.filter(v=>v!==a)];sim.refreshObservations();
-      return driving.restartBlocker(a,near,sim);
-    },
   };
 };
+
+function launchPlan(a:Vehicle,near:Vehicle[],sim:Simulation){
+  sim.vehicles=[a,...near.filter(v=>v!==a)];sim.refreshObservations();
+  const seen=new Set(sim.observations.get(a.id)?.front.map(o=>o.id));
+  return new YieldPrediction().plan(a,near.filter(v=>seen.has(v.id)),8);
+}
 
 test('crossing prediction reserves half a metre before unsafe body occupancy',()=>{
   const a=vehicle(1,route([pt(0,-30),pt(0,40)]),20,4);
@@ -31,7 +33,7 @@ test('crossing prediction reserves half a metre before unsafe body occupancy',()
   const limit=system().crossingRisk(a,b);
   assert.ok(limit!==undefined&&limit>=a.s&&limit<27);
   b.acceleration=-2;
-  assert.equal(system().crossingRisk(a,b),undefined);
+  assert.equal(system().crossingRisk(a,b),limit);
 });
 
 test('front recognition follows configured range and angle and excludes another level',()=>{
@@ -57,16 +59,17 @@ test('prediction releases after crossing traffic clears and ignores separated pa
 });
 
 
-test('starting waits for crossing traffic even when that traffic is braking',()=>{
+test('starting leaves room for crossing traffic even when that traffic is braking',()=>{
   const a=vehicle(1,route([pt(0,-30),pt(0,40)]),25,0);
   const b=vehicle(2,route([pt(-30,0),pt(40,0)]),24,4);
   b.acceleration=-2;
   const sim=new Simulation(new World());
   sim.target=0;sim.vehicles=[a,b];
-  assert.equal(system().restartBlocker(a,[a,b],sim)?.id,b.id);
+  const plan=launchPlan(a,[a,b],sim)!;
+  assert.deepEqual(plan.risks.map(r=>r.id),[b.id]);
   sim.step();
-  assert.equal(a.speed,0);
-  assert.equal(a.s,25);
+  assert.ok(a.s<=plan.limit);
+  assert.ok(a.yieldingTo?.includes(b.id));
   assert.equal(a.state,'yielding');
   sim.vehicles=[a];sim.step();
   assert.ok(a.speed>0);
@@ -77,17 +80,17 @@ test('launch corridor rejects a stopped body within half a metre and permits a f
   const lane=route([pt(0,-30),pt(0,40)]);
   const a=vehicle(1,lane,20,0),b=vehicle(2,lane,24.2,0);
   const sim=new Simulation(new World());
-  assert.equal(system().restartBlocker(a,[b],sim)?.id,b.id);
+  assert.equal(launchPlan(a,[b],sim)?.target,0);
   b.pose.x=4;
-  assert.equal(system().restartBlocker(a,[b],sim),undefined);
+  assert.equal(launchPlan(a,[b],sim),undefined);
 });
 
 test('crossing paths at different times and traffic outside front detection allow starting',()=>{
   const a=vehicle(1,route([pt(0,-30),pt(0,40)]),25,0);
   const b=vehicle(2,route([pt(-30,0),pt(40,0)]),29,8);
   const sim=new Simulation(new World());
-  assert.equal(system().restartBlocker(a,[b],sim),undefined);
+  assert.equal(launchPlan(a,[b],sim),undefined);
   b.s=24;b.pose=b.route.at(24);b.speed=4;
   sim.observationProfiles.car.front.range=0;
-  assert.equal(system().restartBlocker(a,[b],sim),undefined);
+  assert.equal(launchPlan(a,[b],sim),undefined);
 });

@@ -232,8 +232,13 @@ test('turning traffic yields to a conflicting straight vehicle regardless of ID'
     const turning=vehicle(turningId,turn,turn.turns[0].start-10);
     const through=vehicle(3-turningId,straight,12);
     sim.vehicles=[turning,through];
-    sim.step();assert.ok(turning.speed>=6,'A distant approach must not stop a clear turner early');
-    assert.ok(through.speed>=6,'Through traffic keeps priority');
+    sim.step();
+    // These approaches have a predicted conflict within the safety horizon.
+    // Priority permits proceeding once clear; it cannot require keeping speed.
+    for(const v of [turning,through]){
+      assert.ok(v.speed>=6-SPECS.car.emergencyBrake/60-1e-8,'Early yielding respects the braking limit');
+      assert.notEqual(v.reason,'Đánh lái qua khoảng trống an toàn','Moving crossing traffic is resolved by yielding');
+    }
     let yielded=false;
     for(let i=0;i<1200;i++){sim.step();assertNoOverlap(sim);if(turning.state==='yielding'&&turning.blockerId===through.id)yielded=true;}
     assert.ok(yielded,'Turner yields once the through vehicle is nearby in front');

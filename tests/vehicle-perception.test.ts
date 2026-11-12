@@ -3,10 +3,20 @@ import assert from 'node:assert/strict';
 import { BoxGeometry, Mesh, MeshBasicMaterial } from 'three';
 import type { Vehicle } from '../src/simulation';
 import { defaultObservationProfiles } from '../src/vehicle-observation';
-import { observeVehicles } from '../src/vehicle-perception';
+import { observeVehicles, observeInContext, prepareObservationContext } from '../src/vehicle-perception';
 
 function vehicle(id:number,x:number,z:number,y=0):Vehicle{return {id,kind:'car',pose:{x,y,z,angle:0},s:0,arrived:false,inGarage:false} as Vehicle;}
 function body(v:Vehicle){const mesh=new Mesh(new BoxGeometry(1.8,2,3.9),new MeshBasicMaterial());mesh.position.set(v.pose.x,v.pose.y+1,v.pose.z);mesh.updateMatrixWorld(true);return mesh;}
+
+test('spatially indexed observation matches exact observation and refreshes after motion',()=>{
+  const observer=vehicle(1,-12,-12),targets=[observer,...Array.from({length:100},(_,i)=>vehicle(i+2,(i%10)*12-60,Math.floor(i/10)*12-60))].map(vehicle=>({vehicle,object:body(vehicle)}));
+  const context={targets,occluders:[]},profile=defaultObservationProfiles().car;
+  prepareObservationContext(context);
+  assert.deepEqual(observeInContext(observer,profile,context),observeVehicles(observer,profile,targets,[]));
+  targets[1].vehicle.pose={...observer.pose,z:observer.pose.z+8};
+  prepareObservationContext(context);
+  assert.deepEqual(observeInContext(observer,profile,context),observeVehicles(observer,profile,targets,[]));
+});
 
 test('detects visible vehicles in front and behind, ordered by distance and excluding self',()=>{
   const observer=vehicle(1,0,0),near=vehicle(2,0,8),far=vehicle(3,0,16),behind=vehicle(4,0,-7),outside=vehicle(5,0,-30);

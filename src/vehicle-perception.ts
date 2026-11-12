@@ -1,11 +1,21 @@
 import * as THREE from 'three';
 import { SPECS, type Vehicle, type VehicleKind } from './simulation';
 import { isObservationPointVisible, type ObservationPose, type ObservationProfile } from './vehicle-observation';
+import { SpatialGrid } from './spatial-grid';
 
 export type ObservedVehicle = { id:number; kind:VehicleKind; distance:number; sampleIndex:number };
 export type VehicleObservations = { front:ObservedVehicle[]; rear:ObservedVehicle[] };
 export type ObservationContext = { targets:ObservationTarget[]; occluders:THREE.Object3D[]; bounds?:Map<THREE.Object3D,THREE.Box3> };
 export type ObservationTarget = { vehicle:Vehicle; object:THREE.Object3D };
+
+type PreparedContext={grid:SpatialGrid<ObservationTarget>;byId:Map<number,ObservationTarget>;samples:Map<number,THREE.Vector3[]>};
+const prepared=new WeakMap<ObservationContext,PreparedContext>();
+/** Rebuilt once per simulation snapshot, never reused after bodies move. */
+export function prepareObservationContext(context:ObservationContext){
+  const grid=new SpatialGrid<ObservationTarget>(),byId=new Map<number,ObservationTarget>();
+  for(const target of context.targets){grid.insert(target,target.vehicle.pose.x,target.vehicle.pose.z);byId.set(target.vehicle.id,target);}
+  prepared.set(context,{grid,byId,samples:new Map()});
+}
 
 /** Eye height and road pitch are shared by the display and detection. */
 export function vehicleObservationPose(vehicle:Vehicle):ObservationPose {
@@ -31,13 +41,14 @@ export function vehicleObservationSamples(vehicle:Vehicle):THREE.Vector3[] {
 /** The caller supplies current world matrices and roots for opaque scene objects.
  * The target's own root is excluded; other vehicles remain potential occluders.
  * A vehicle is visible when at least one body sample has an unobstructed sightline. */
-export function observeVehicles(observer:Vehicle,profile:ObservationProfile,targets:ObservationTarget[],occluders:THREE.Object3D[]):VehicleObservations {
+export function observeVehicles(observer:Vehicle,profile:ObservationProfile,targets:ObservationTarget[],occluders:THREE.Object3D[],samples?:Map<number,THREE.Vector3[]>):VehicleObservations {
   const result:VehicleObservations={front:[],rear:[]},eye=vehicleObservationPose(observer);
   for(const {vehicle,object} of targets){
     if(vehicle.id===observer.id||vehicle.arrived||vehicle.inGarage)continue;
     const bound=Math.hypot(SPECS[vehicle.kind].width/2,SPECS[vehicle.kind].length/2,2.5);
     if(Math.hypot(vehicle.pose.x-eye.x,vehicle.pose.y-eye.y,vehicle.pose.z-eye.z)>Math.max(profile.front.range,profile.rear.range)+bound)continue;
-    const points=vehicleObservationSamples(vehicle);
+    let points=samples?.get(vehicle.id);
+    if(!points){points=vehicleObservationSamples(vehicle);samples?.set(vehicle.id,points);}
     const otherSolids=occluders.filter(root=>root!==object);
     const front=points.findIndex(point=>isObservationPointVisible(eye,point,profile.front,otherSolids));
     const rear=points.findIndex(point=>isObservationPointVisible(eye,point,profile.rear,otherSolids,true));
@@ -58,9 +69,12 @@ export function observationContext(vehicles:Vehicle[]):ObservationContext {
 }
 
 export function observeInContext(observer:Vehicle,profile:ObservationProfile,context:ObservationContext):VehicleObservations {
-  const own=context.targets.find(t=>t.vehicle.id===observer.id)?.object;
+  const cache=prepared.get(context);
+  const own=(cache?.byId.get(observer.id)??context.targets.find(t=>t.vehicle.id===observer.id))?.object;
   const pose=vehicleObservationPose(observer),eye=new THREE.Vector3(pose.x,pose.y,pose.z);
   const range=Math.max(profile.front.range,profile.rear.range);
   const occluders=context.occluders.filter(o=>o!==own&&(!context.bounds?.has(o)||context.bounds.get(o)!.distanceToPoint(eye)<=range));
-  return observeVehicles(observer,profile,context.targets,occluders);
+  // Six metres conservatively encloses the largest target's body samples.
+  const targets=cache?.grid.query(observer.pose.x,observer.pose.z,range+6)??context.targets;
+  return observeVehicles(observer,profile,targets,occluders,cache?.samples);
 }

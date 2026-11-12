@@ -1,7 +1,8 @@
-import { observationContext, observeInContext, type ObservationContext, type VehicleObservations } from './vehicle-perception';
+import { observationContext, observeInContext, prepareObservationContext, type ObservationContext, type VehicleObservations } from './vehicle-perception';
 import type { VehicleMotionState } from './vehicle-motion';
 import { defaultObservationProfiles } from './vehicle-observation';
 import { DrivingSystem } from './driving';
+import { PriorityQueue } from './priority-queue';
 export type Point = { x: number; y: number; z: number };
 export type DrivingSide = 'right' | 'left';
 export type Road = { id: number; points: Point[]; width: number; oneWay: boolean; roundabout?: boolean; priority?: number; control?: 'none' | 'yield' | 'stop'; junctionMode?: 'priority' | 'zipper' | 'all-way-stop' };
@@ -139,7 +140,7 @@ type Edge={road:Road;reverse:boolean;start:string;end:string;length:number};
 type WayPoint=Point&{width:number};
 export type Pose=Point&{angle:number};
 export type DrivingState = 'driving' | 'following' | 'red-light' | 'yielding' | 'exit-blocked' | 'stopping' | 'blocked' | 'reversing' | 'garage' | 'merging';
-export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean; state?:DrivingState; motionState?:VehicleMotionState; reason?:string; blockerId?:number; stuckTime?:number; velocity?:number; acceleration?:number; steering?:number; indicator?:-1|0|1; braking?:boolean; approachSince?:number; approachId?:string; stopTime?:number; stopSince?:number; driverFactor?:number; lane?:number; rerouteAt?:number; tripDistance?:number};
+export type Vehicle={id:number;kind:VehicleKind;route:Route;s:number;offset:number;targetOffset:number;speed:number;pose:Pose;waiting:number;age:number;arrived:boolean;blocked:boolean;decision:number;garageYield?:number;inGarage?:boolean;leftHouse?:boolean; state?:DrivingState; motionState?:VehicleMotionState; reason?:string; blockerId?:number; yieldingTo?:number[]; stuckTime?:number; velocity?:number; acceleration?:number; steering?:number; indicator?:-1|0|1; braking?:boolean; approachSince?:number; approachId?:string; stopTime?:number; stopSince?:number; driverFactor?:number; lane?:number; rerouteAt?:number; tripDistance?:number};
 export type Movement = { id:string; entry:number; exit:number; stop:number; center:Point; incoming:number; outgoing:number; incomingRoad?:number; turn:-1|0|1; priority:number; control:'none'|'yield'|'stop'; mode:'priority'|'zipper'|'all-way-stop'; circulating:boolean; enteringRoundabout:boolean; light?:Light };
 export class Route {
   movements:Movement[]=[]; roadIds:number[]=[];
@@ -171,14 +172,18 @@ export class Route {
     }
   }
   locate(p:Point, around=0, radius=Infinity){
-    let best={s:around,offset:0,distance:Infinity};
+    let bestS=around,bestSquared=Infinity;
     let low=0,high=this.lengths.length-1;
     while(low+1<high){const mid=(low+high)>>1;if(this.lengths[mid]<around-radius)low=mid;else high=mid;}
     for(let i=Math.max(1,low);i<this.points.length&&this.lengths[i-1]<=around+radius;i++){
-      const q=project(p,this.points[i-1],this.points[i]);
-      if(q.distance<best.distance){const s=this.lengths[i-1]+(this.lengths[i]-this.lengths[i-1])*q.t,pose=this.at(s);best={s,offset:(p.x-pose.x)*Math.cos(pose.angle)-(p.z-pose.z)*Math.sin(pose.angle),distance:q.distance};}
+      const a=this.points[i-1],b=this.points[i],dx=b.x-a.x,dz=b.z-a.z;
+      const t=clamp(((p.x-a.x)*dx+(p.z-a.z)*dz)/(dx*dx+dz*dz||1),0,1);
+      const x=p.x-(a.x+dx*t),z=p.z-(a.z+dz*t),squared=x*x+z*z;
+      if(squared<bestSquared){bestSquared=squared;bestS=this.lengths[i-1]+(this.lengths[i]-this.lengths[i-1])*t;}
     }
-    return best;
+    if(bestSquared===Infinity)return {s:around,offset:0,distance:Infinity};
+    const pose=this.at(bestS);
+    return {s:bestS,offset:(p.x-pose.x)*Math.cos(pose.angle)-(p.z-pose.z)*Math.sin(pose.angle),distance:Math.sqrt(bestSquared)};
   }
   curvature(s:number){const a=this.at(s-1).angle,b=this.at(s+1).angle;return Math.atan2(Math.sin(b-a),Math.cos(b-a))/2;}
   movement(s:number,ahead=24){return this.movements.find(m=>m.exit>=s&&m.stop<=s+ahead);}
@@ -187,12 +192,12 @@ export class Route {
     s=clamp(s,0,this.total);let low=0,high=this.lengths.length-1;
     while(low+1<high){const mid=(low+high)>>1;if(this.lengths[mid]<=s)low=mid;else high=mid;}
     const a=this.points[low],b=this.points[high],t=(s-this.lengths[low])/(this.lengths[high]-this.lengths[low]||1);
-    return {...lerp(a,b,t),width:Math.min(a.width,b.width)};
+    return {x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:a.z+(b.z-a.z)*t,width:Math.min(a.width,b.width)};
   }
   at(s:number,offset=0):Pose&{width:number} {
     s=clamp(s,0,this.total);
     const p=this.position(s),a=this.position(s-1.5),b=this.position(s+1.5),angle=Math.atan2(b.x-a.x,b.z-a.z);
-    return {...p,x:p.x+Math.cos(angle)*offset,z:p.z-Math.sin(angle)*offset,angle};
+    return {x:p.x+Math.cos(angle)*offset,y:p.y,z:p.z-Math.sin(angle)*offset,width:p.width,angle};
   }
 }
 export function overlaps(a:Pose,ak:VehicleKind,b:Pose,bk:VehicleKind,margin=.12) {
@@ -249,9 +254,12 @@ function connectPaths(chunks:WayPoint[][]):WayPoint[]{
   }
   return cleanPoints(result);
 }
-export function planRoute(world:World,from:House,to:House,options:{kind?:VehicleKind;roadDelay?:Map<number,number>;startPose?:Pose}={}):Route|null {
+export function planRoute(world:World,from:House,to:House,options:{kind?:VehicleKind;roadDelay?:Map<number,number>;startPose?:Pose;travelTime?:boolean}={}):Route|null {
   const a=world.nearest(pt(from.x,from.z)),b=world.nearest(pt(to.x,to.z));if(!a||!b)return null;
   const edges:Edge[]=world.roads.flatMap(road=>{const base={road,start:key(road.points[0]),end:key(road.points.at(-1)!),length:road.points.slice(1).reduce((s,p,i)=>s+dist(p,road.points[i]),0),reverse:false};return road.oneWay?[base]:[base,{...base,start:base.end,end:base.start,reverse:true}];});
+  const divisor=options.travelTime?SPECS[options.kind??'car'].speed:1;
+  const outgoing=new Map<string,Edge[]>();
+  for(const edge of edges){const bucket=outgoing.get(edge.start);if(bucket)bucket.push(edge);else outgoing.set(edge.start,[edge]);}
   let best:{cost:number;path:WayPoint[]}|null=null;
   // Driveways join the closest carriageway; avoid crossing opposing traffic at every house.
   const nearSide=(q:NonNullable<ReturnType<World['nearest']>>,h:House)=>{const p=q.road.points[q.index],n=q.road.points[q.index+1];const leftSide=(h.x-q.point.x)*(n.z-p.z)-(h.z-q.point.z)*(n.x-p.x)<0;return world.drivingSide==='left'?leftSide:!leftSide;};
@@ -267,19 +275,21 @@ export function planRoute(world:World,from:House,to:House,options:{kind?:Vehicle
     const edgeKey=(road:Road,reverse:boolean)=>`${road.id}:${Number(reverse)}`;
     const initial=edgeKey(a.road,reverseA);
     const states=new Map<string,{node:string;road:Road;reverse:boolean}>([[initial,{node:start,road:a.road,reverse:reverseA}]]);
-    const costs=new Map([[initial,0]]),prev=new Map<string,{from:string;edge:Edge}>(),pending=new Set([initial]),visited=new Set<string>();
+    const costs=new Map([[initial,0]]),prev=new Map<string,{from:string;edge:Edge}>(),pending=new PriorityQueue<string>(),visited=new Set<string>();
+    pending.push(initial,0);
     let terminal:string|null=null;
     while(pending.size){
-      const state=[...pending].sort((x,y)=>costs.get(x)!-costs.get(y)!)[0];pending.delete(state);
+      const entry=pending.pop(),state=entry.value;
+      if(visited.has(state)||entry.cost!==costs.get(state))continue;
       const incoming=states.get(state)!;
       if(incoming.node===end&&!(incoming.road===b.road&&incoming.reverse!==reverseB)){terminal=state;break;}
       visited.add(state);
-      for(const e of edges){
+      for(const e of outgoing.get(incoming.node)??[]){
         if(e.start!==incoming.node||(e.road===incoming.road&&e.reverse!==incoming.reverse))continue;
-        const next=edgeKey(e.road,e.reverse),cost=costs.get(state)!+e.length+(options.roadDelay?.get(e.road.id)??0);
+        const next=edgeKey(e.road,e.reverse),cost=costs.get(state)!+e.length/divisor+(options.roadDelay?.get(e.road.id)??0);
         if(options.kind&&e.road.width<SPECS[options.kind].width+.55)continue;
         if(!visited.has(next)&&cost<(costs.get(next)??Infinity)){
-          costs.set(next,cost);states.set(next,{node:e.end,road:e.road,reverse:e.reverse});prev.set(next,{from:state,edge:e});pending.add(next);
+          costs.set(next,cost);states.set(next,{node:e.end,road:e.road,reverse:e.reverse});prev.set(next,{from:state,edge:e});pending.push(next,cost);
         }
       }
     }
@@ -288,11 +298,11 @@ export function planRoute(world:World,from:House,to:House,options:{kind?:Vehicle
     while(state!==initial){const step=prev.get(state)!;middle.unshift(step.edge);state=step.from;}
     const chunks=[directed(a.road,reverseA,world.drivingSide,first),...middle.map(e=>directed(e.road,e.reverse,world.drivingSide)),directed(b.road,reverseB,world.drivingSide,last)].filter(c=>c.length>1);
     const route=connectPaths(chunks);
-    const cost=route.slice(1).reduce((s,p,i)=>s+dist(p,route[i]),0)+(reverseA!==sideA?25:0)+(reverseB!==sideB?25:0)+(options.roadDelay?.get(a.road.id)??0)+(options.roadDelay?.get(b.road.id)??0)+middle.reduce((sum,e)=>sum+(options.roadDelay?.get(e.road.id)??0),0);
+    const cost=(route.slice(1).reduce((s,p,i)=>s+dist(p,route[i]),0)+(reverseA!==sideA?25:0)+(reverseB!==sideB?25:0))/divisor+(options.roadDelay?.get(a.road.id)??0)+(options.roadDelay?.get(b.road.id)??0)+middle.reduce((sum,e)=>sum+(options.roadDelay?.get(e.road.id)??0),0);
     if(!best||cost<best.cost)best={cost,path:route};
   }
   // Direct trips on the same road do not need to circle through an endpoint.
-  if(a.road===b.road){const reverse=a.index+a.t>b.index+b.t;const tangent=Math.atan2(a.road.points[a.index+1].x-a.road.points[a.index].x,a.road.points[a.index+1].z-a.road.points[a.index].z)+(reverse?Math.PI:0);if((!a.road.oneWay||!reverse)&&(!options.startPose||Math.cos(tangent-options.startPose.angle)>.85)){const lo=reverse?b:a,hi=reverse?a:b;const raw=[lo.point,...a.road.points.slice(lo.index+1,hi.index+1),hi.point];const path=directed(a.road,reverse,world.drivingSide,raw);const cost=path.slice(1).reduce((s,p,i)=>s+dist(p,path[i]),0)+(reverse!==sideA?25:0)+(reverse!==sideB?25:0)+(options.roadDelay?.get(a.road.id)??0);if(!best||cost<best.cost)best={cost,path};}}
+  if(a.road===b.road){const reverse=a.index+a.t>b.index+b.t;const tangent=Math.atan2(a.road.points[a.index+1].x-a.road.points[a.index].x,a.road.points[a.index+1].z-a.road.points[a.index].z)+(reverse?Math.PI:0);if((!a.road.oneWay||!reverse)&&(!options.startPose||Math.cos(tangent-options.startPose.angle)>.85)){const lo=reverse?b:a,hi=reverse?a:b;const raw=[lo.point,...a.road.points.slice(lo.index+1,hi.index+1),hi.point];const path=directed(a.road,reverse,world.drivingSide,raw);const cost=(path.slice(1).reduce((s,p,i)=>s+dist(p,path[i]),0)+(reverse!==sideA?25:0)+(reverse!==sideB?25:0))/divisor+(options.roadDelay?.get(a.road.id)??0);if(!best||cost<best.cost)best={cost,path};}}
   if(!best||best.path.length<2)return null;
   // Driveways connect the actual house doorway to the road.
   const door=(h:House,side:number):WayPoint=>({...pt(h.x+Math.sin(h.angle)*4.2+Math.cos(h.angle)*side,h.z+Math.cos(h.angle)*4.2-Math.sin(h.angle)*side),width:6.4});
@@ -366,6 +376,7 @@ export class Simulation {
   observations=new Map<number,VehicleObservations>();
   refreshObservations(){
     const context=this.prepareObservation?.(this)??observationContext(this.vehicles);
+    prepareObservationContext(context);
     this.observations.clear();
     for(const v of this.vehicles)if(!v.arrived&&!v.inGarage)
       this.observations.set(v.id,observeInContext(v,this.observationProfiles[v.kind],context));
@@ -402,7 +413,7 @@ export class Simulation {
     const kinds=(Object.keys(this.types) as VehicleKind[]).filter(k=>this.types[k]);if(!kinds.length||this.world.houses.length<2)return;
     const from=this.world.houses[Math.floor(this.random()*this.world.houses.length)],to=this.world.houses[Math.floor(this.random()*this.world.houses.length)];if(from===to)return;
     const distribution=kinds.flatMap(k=>Array.from({length:k==='bike'?5:k==='car'?3:1},()=>k));
-    const kind=distribution[Math.floor(this.random()*distribution.length)],route=planRoute(this.world,from,to,{kind,roadDelay:this.driving.roadDelay(this)});if(!route||route.total<8)return;
+    const kind=distribution[Math.floor(this.random()*distribution.length)],route=planRoute(this.world,from,to,{kind,roadDelay:this.driving.roadDelay(this),travelTime:true});if(!route||route.total<8)return;
     const pose=route.at(0);if(this.vehicles.some(v=>!v.inGarage&&overlaps(pose,kind,v.pose,v.kind,.45)))return;
     this.vehicles.push({id:this.nextId++,kind,route,s:0,offset:0,targetOffset:0,speed:0,pose,waiting:0,age:0,arrived:false,blocked:false,decision:0,driverFactor:.92+this.random()*.16});
   }

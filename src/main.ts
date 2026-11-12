@@ -83,7 +83,8 @@ function updateVehicleInspector(){
   const roundedAcceleration=Number(acceleration.toFixed(2));
   $('vehicle-acceleration').textContent=`Gia tốc: ${roundedAcceleration>0?'+':''}${roundedAcceleration.toFixed(2)} m/s²`;
   $('vehicle-name').textContent=`${names[vehicle.kind]} #${vehicle.id}`;
-  $('vehicle-details').textContent=`${Math.round(Math.abs(vehicle.velocity??vehicle.speed)*3.6)} km/h · Còn ${Math.ceil(Math.max(0,vehicle.route.total-vehicle.s))} m · ${STATE_LABELS[vehicle.state??'driving']} — ${vehicle.reason??'Đường thông thoáng'}`;
+  const yielding=vehicle.yieldingTo?.map(id=>`#${id}`).join(', ')??'';
+  $('vehicle-details').textContent=`${Math.round(Math.abs(vehicle.velocity??vehicle.speed)*3.6)} km/h · Còn ${Math.ceil(Math.max(0,vehicle.route.total-vehicle.s))} m · ${STATE_LABELS[vehicle.state??'driving']} — ${vehicle.reason??'Đường thông thoáng'}${(vehicle.yieldingTo?.length??0)>1&&!vehicle.reason?.includes(yielding)?` · Các xe cần nhường: ${yielding}`:''}`;
 }
 function selectVehicle(id:number){
   selectedRoad=null;$('selected-road').hidden=true;scene.preview([],width);
@@ -193,7 +194,23 @@ document.addEventListener('keydown',e=>{if((e.target as HTMLElement).matches('in
 window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
 function updateStats(){updateVehicleInspector();const moving=sim.vehicles.filter(v=>v.speed>.5).length;const length=Math.round(world.roads.reduce((total,r)=>total+r.points.slice(1).reduce((s,p,i)=>s+dist(p,r.points[i]),0),0));$('stat-vehicles').innerHTML=`${sim.vehicles.length}<small> phương tiện</small>`;$('stat-roads').innerHTML=`${length.toLocaleString('vi-VN')}<small> m</small>`;$('stat-houses').innerHTML=`${world.houses.filter(h=>{const q=world.nearest(pt(h.x,h.z));return q&&q.distance<26;}).length}<small> ngôi nhà</small>`;$('stat-flow').innerHTML=`${sim.vehicles.length?Math.round(moving/sim.vehicles.length*100):100}<small> % đang chạy</small>`;$('stat-completed').textContent=`${sim.completed} hành trình hoàn thành`;const minutes=Math.floor(sim.time/3)+480;$('sim-time').textContent=`${String(Math.floor(minutes/60)%24).padStart(2,'0')}:${String(minutes%60).padStart(2,'0')}`;}
 let last=performance.now(),accumulator=0,statsClock=0;
-function frame(now:number){const elapsed=Math.min((now-last)/1000,.1);last=now;accumulator+=elapsed*speed;let steps=0;while(accumulator>=1/60&&steps<24){sim.step(1/60);timeline.record();accumulator-=1/60;steps++;}updateTimeline();scene.update(sim,1);if(scene.selectedVehicleId===null&&!$('vehicle-inspector').hidden){clearVehicleSelection();$('directions-legend').hidden=!scene.showDirections;}statsClock+=elapsed;if(statsClock>.5){updateStats();statsClock=0;}requestAnimationFrame(frame);}
+function frame(now:number){
+  const elapsed=Math.min((now-last)/1000,.1);last=now;
+  // Bound catch-up work. Under overload the simulation slows down instead of
+  // accumulating an ever-growing backlog and freezing interaction.
+  accumulator=Math.min(accumulator+elapsed*speed,.4);
+  const deadline=performance.now()+8;
+  let steps=0;
+  while(accumulator>=1/60&&steps<24){
+    sim.step(1/60);timeline.record();accumulator-=1/60;steps++;
+    if(performance.now()>=deadline)break;
+  }
+  updateTimeline();scene.update(sim,1);
+  if(scene.selectedVehicleId===null&&!$('vehicle-inspector').hidden){clearVehicleSelection();$('directions-legend').hidden=!scene.showDirections;}
+  statsClock+=elapsed;
+  if(statsClock>.5){updateStats();statsClock=0;}
+  requestAnimationFrame(frame);
+}
 updateStats();requestAnimationFrame(frame);
 // A read-only snapshot makes automated smoke checks possible without coupling tests to WebGL.
 (window as unknown as {__PHO_FLOW__:unknown}).__PHO_FLOW__={snapshot:()=>({vehicles:sim.vehicles.length,roads:world.roads.length,houses:world.houses.length,completed:sim.completed,time:sim.time,paused:sim.paused,drivingSide:world.drivingSide,selectedVehicleId:scene.selectedVehicleId,observationVisible:scene.observationGuide.group.visible,observedVehicleId:scene.observedVehicleId,observations:scene.observations,observationLinkIds:scene.observationLinks.ids,directionVehicleIds:scene.directions.group.visible?scene.directions.group.children.map(g=>Number(g.name.replace('vehicle-direction-',''))):[]}),get world(){return world;},get simulation(){return sim;}};

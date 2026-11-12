@@ -1,6 +1,7 @@
+import { YIELD_BUFFER, YieldPrediction } from './vehicle-yield-prediction';
 import { vehicleMotionState } from './vehicle-motion';
-import { driveArc } from './kinematics';
-import { sweptOverlaps } from './collision';
+import { advanceVehicle, driveArc } from './kinematics';
+import { sweptOverlaps, movingBodiesOverlap, separatesContact } from './collision';
 import { SPECS, overlaps, dist, project, signalState, planRoute, type Simulation, type Vehicle, type Pose, type Movement, type DrivingState, type Road, type Point } from './simulation';
 
 const clamp=(n:number,a:number,b:number)=>Math.max(a,Math.min(b,n));
@@ -11,7 +12,7 @@ export const STATE_LABELS:Record<DrivingState,string>={driving:'Đang chạy',fo
 
 type Conflict={a:number;b:number;until:number};
 type ReversePlan={other:number;target:number;until:number;start:number;travelled?:number;steering?:number;blockedFor?:number;group?:number[]};
-type Intent={target:number;limit:number;state:DrivingState;reason:string;other?:number;leader?:number;movement?:Movement;legal:boolean;line?:Pose};
+type Intent={target:number;limit:number;state:DrivingState;reason:string;other?:number;leader?:number;movement?:Movement;legal:boolean;line?:Pose;travelLimit?:number;yieldingTo?:number[];avoidanceSteering?:number;avoidanceOffset?:number};
 
 /** Decision state is separate from physical motion. Legal stops never trigger recovery. */
 export class DrivingSystem {
@@ -26,9 +27,13 @@ export class DrivingSystem {
   private lastMerge=new Map<string,number>();
   private grants=new Map<number,number>();
   private tick=0;
+  private avoidance=new Map<number,{steering?:number;targetOffset?:number;until?:number;retryAt:number}>();
   private surfaces=new Map<string,{a:Point;b:Point;road:Road}[]>();
   private surfaceReady=false;
   private stoppedPaths=new Map<number,{key:string;steps:{pose:Pose;s:number}[]}>();
+  private trafficDelay=new Map<number,number>();
+  private trafficAt=-Infinity;
+  private trafficVersion=-1;
 
   snapshot(){
     const {surfaces, surfaceReady, stoppedPaths, ...state}=this;
@@ -41,8 +46,22 @@ export class DrivingSystem {
   }
 
   roadDelay(sim:Simulation){
+    if(sim.time-this.trafficAt<.5&&this.trafficVersion===sim.world.nextId)return this.trafficDelay;
     const delay=new Map<number,number>();
-    for(const v of sim.vehicles){if(!active(v))continue;const road=sim.world.nearest(v.pose)?.road;if(road)delay.set(road.id,(delay.get(road.id)??0)+(v.speed<1?8:1));}
+    for(const v of sim.vehicles){
+      if(!active(v))continue;
+      const road=sim.world.nearest(v.pose)?.road;if(!road)continue;
+      const spec=SPECS[v.kind],speed=Math.max(0,v.velocity??v.speed);
+      // Seconds lost to occupied queue space and slow discharge; not metres.
+      const lost=speed<1?spec.headway+(spec.length+1)/2+.5+Math.min(4,v.waiting*.1)
+        :Math.max(0,(spec.length+1)/speed-(spec.length+1)/spec.speed);
+      delay.set(road.id,(delay.get(road.id)??0)+lost);
+    }
+    if(this.trafficVersion===sim.world.nextId)for(const id of new Set([...delay.keys(),...this.trafficDelay.keys()])){
+      const value=(this.trafficDelay.get(id)??0)*.6+(delay.get(id)??0)*.4;
+      if(value>.05)delay.set(id,value);else delay.delete(id);
+    }
+    this.trafficDelay=delay;this.trafficAt=sim.time;this.trafficVersion=sim.world.nextId;
     return delay;
   }
 
@@ -124,7 +143,7 @@ export class DrivingSystem {
    * Stop half a metre before the first unsafe body position, not its centre. */
   private crossingRisk(v:Vehicle,other:Vehicle){
     const speed=Math.max(0,other.velocity??other.speed);
-    if(speed<.3||(other.acceleration??0)<-.5)return undefined;
+    if(speed<.3)return undefined;
     const spec=SPECS[v.kind],step=.1,horizon=5;
     let previous=v.pose,previousOther=other.pose,previousDistance=0;
     for(let t=step;t<=horizon;t+=step){
@@ -137,36 +156,6 @@ export class DrivingSystem {
       if(sweptOverlaps(previous,relative,v.kind,previousOther,other.kind,.1)
         ||overlaps(own,v.kind,theirs,other.kind,.1))return Math.max(v.s,v.s+previousDistance-.5);
       previous=own;previousOther=theirs;previousDistance=distance;
-    }
-    return undefined;
-  }
-
-  /** A stationary driver must find a clear launch corridor even with priority.
-   * Moving traffic retains its measured speed, including traffic braking now. */
-  private restartBlocker(v:Vehicle,near:Vehicle[],sim:Simulation){
-    if(Math.abs(v.velocity??v.speed)>=.15)return undefined;
-    for(const other of near){
-      if(other===v||!active(other)||other.garageYield===v.id||!this.seesFront(v,other,sim))continue;
-      const speed=other.velocity??other.speed;
-      if(Math.abs(speed)<.15){
-        if(sweptOverlaps(v.pose,v.route.at(Math.min(v.route.total,v.s+.5),v.targetOffset),v.kind,other.pose,other.kind,0))return other;
-        continue;
-      }
-      let previous=v.pose,previousOther=other.pose;
-      const accel=SPECS[v.kind].accel,launchSpeed=2,launchTime=launchSpeed/accel;
-      for(let t=.1;t<=5+.0001;t+=.1){
-        // Accelerate to a modest launch speed; zero current speed alone cannot
-        // tell whether starting into a moving vehicle's path would be safe.
-        const distance=t<launchTime?.5*accel*t*t:.5*accel*launchTime**2+launchSpeed*(t-launchTime);
-        if(distance>this.frontLook(v))break;
-        const own=v.route.at(Math.min(v.route.total,v.s+distance),v.targetOffset);
-        const theirs=this.forecast(other,t);
-        const relative={...own,x:own.x-(theirs.x-previousOther.x),
-          y:own.y-(theirs.y-previousOther.y),z:own.z-(theirs.z-previousOther.z)};
-        if(sweptOverlaps(previous,relative,v.kind,previousOther,other.kind,.25)
-          ||overlaps(own,v.kind,theirs,other.kind,.25))return other;
-        previous=own;previousOther=theirs;
-      }
     }
     return undefined;
   }
@@ -289,6 +278,7 @@ export class DrivingSystem {
   }
 
   private stop(intent:Intent,v:Vehicle,s:number,state:DrivingState,reason:string,other?:number){
+    if(other!==undefined){intent.yieldingTo??=[];if(!intent.yieldingTo.includes(other))intent.yieldingTo.push(other);}
     if(s<intent.limit){intent.limit=Math.max(v.s,s);intent.state=state;intent.reason=reason;intent.other=other;intent.legal=state!=='blocked';}
     intent.target=Math.min(intent.target,Math.sqrt(2*Math.min(1.8,SPECS[v.kind].brake)*Math.max(0,s-v.s-.15)));
   }
@@ -352,20 +342,7 @@ export class DrivingSystem {
   /** Rear-axle bicycle integration: all displacement follows the body's heading.
    * Steering can change while stopped; position and yaw cannot. */
   private motion(v:Vehicle,distance:number,targetOffset:number,dt:number,steerOverride?:number){
-    const spec=SPECS[v.kind],direction=Math.sign(distance)||1;
-    const look=Math.max(1.3,spec.wheelbase*.65)+Math.abs(distance/dt)*.25;
-    const aimS=v.s+direction*look,target=v.route.at(aimS,targetOffset);
-    const extension=aimS-clamp(aimS,0,v.route.total);
-    target.x+=Math.sin(target.angle)*extension;target.z+=Math.cos(target.angle)*extension;
-    const bearing=Math.atan2(target.x-v.pose.x,target.z-v.pose.z);
-    const error=angle(bearing-v.pose.angle-(direction<0?Math.PI:0));
-    const curvature=2*Math.sin(error)/Math.max(.5,dist(v.pose,target));
-    const desiredSteering=steerOverride??clamp(Math.atan(spec.wheelbase*curvature)*direction,-spec.maxSteer,spec.maxSteer);
-    const steering=(v.steering??0)+clamp(desiredSteering-(v.steering??0),-dt*1.3,dt*1.3);
-    const pose=driveArc(v.pose,distance,steering,spec.wheelbase);
-    const q=v.route.locate(pose,v.s,Math.abs(distance)+4);
-    pose.y=v.route.at(q.s).y;
-    return {pose,s:q.s,offset:q.offset,steering};
+    return advanceVehicle(v,distance,targetOffset,dt,steerOverride);
   }
 
   private surfaceAt(p:Point,sim:Simulation){
@@ -402,7 +379,8 @@ export class DrivingSystem {
     }
     // A rotating corner can touch within the first millimetres and be clear
     // again at 10 cm. The planner and commit use the same continuous sweep.
-    if(near.some(o=>o.id!==v.id&&active(o)&&sweptOverlaps(v.pose,next.pose,v.kind,o.pose,o.kind,.06)))return false;
+    if(near.some(o=>o.id!==v.id&&active(o)&&sweptOverlaps(v.pose,next.pose,v.kind,o.pose,o.kind,.06)
+      &&!(manoeuvring&&Math.abs(v.speed)<=1&&separatesContact(v.pose,next.pose,v.kind,o.pose,o.kind))))return false;
     const driveway=next.s<v.route.departureLength+3||next.s>v.route.total-v.route.arrivalLength-3;
     const bound=Math.max(0,((driveway?Math.max(8,v.route.at(next.s).width):v.route.at(next.s).width)-SPECS[v.kind].width)/2-.12);
     if(Math.abs(next.offset)>bound+.12){
@@ -440,6 +418,19 @@ export class DrivingSystem {
     return driveArc(v.pose,(v.velocity??v.speed)*time,v.steering??0,SPECS[v.kind].wheelbase);
   }
 
+  private reserveRetreats(vehicles:Vehicle[]){
+    this.reserved.clear();
+    const byId=new Map(vehicles.map(v=>[v.id,v]));
+    for(const [id,plan] of this.reverse){
+      const owner=byId.get(id);if(!owner)continue;
+      const remaining=Math.max(0,Math.min(4,plan.start-plan.target)-(plan.travelled??0));
+      const poses:Pose[]=[owner.pose];
+      for(let d=.2;d<remaining;d+=.2)poses.push(driveArc(owner.pose,-d,plan.steering??owner.steering??0,SPECS[owner.kind].wheelbase));
+      if(remaining>0)poses.push(driveArc(owner.pose,-remaining,plan.steering??owner.steering??0,SPECS[owner.kind].wheelbase));
+      this.reserved.set(id,{kind:owner.kind,poses});
+    }
+  }
+
   private rearRoom(v:Vehicle,near:Vehicle[],max=4,steering=v.steering??0){
     // The reverse is pre-steered while stationary. Sweep the same curve the
     // integrator will actually drive; checking only its endpoint can miss a
@@ -449,7 +440,11 @@ export class DrivingSystem {
     while(room<limit-.00001){
       const step=Math.min(.05,limit-room),time=(room+step)/.9;
       const next=this.motion(probe,-step,0,step/.9,steering);
-      if(near.some(o=>o.id!==v.id&&active(o)&&[0,Math.min(1,time),Math.min(2,time)].some(t=>sweptOverlaps(probe.pose,next.pose,v.kind,this.forecast(o,t),o.kind,.06))))break;
+      if(near.some(o=>o.id!==v.id&&active(o)&&[0,Math.min(1,time),Math.min(2,time)].some(t=>{
+        const pose=this.forecast(o,t);
+        return sweptOverlaps(probe.pose,next.pose,v.kind,pose,o.kind,.06)
+          &&!(Math.abs(o.velocity??o.speed)<.15&&separatesContact(probe.pose,next.pose,v.kind,pose,o.kind));
+      })))break;
       room+=step;probe={...probe,...next};
     }
     return room;
@@ -465,8 +460,10 @@ export class DrivingSystem {
         free+=.1;probe={...probe,...next};
       }
       const progress=probe.s-v.s,alignment=Math.abs(angle(probe.pose.angle-v.route.at(probe.s).angle));
-      return {v,steering,free,progress,score:progress-alignment*.5-Math.abs(probe.offset)*.2};
-    }).filter(c=>c.free>=.8&&c.progress>.25).sort((a,b)=>b.score-a.score);
+      const end=driveArc(probe.pose,YIELD_BUFFER,steering,SPECS[v.kind].wheelbase);
+      const keepsBuffer=!(v.yieldingTo?.length&&others.some(o=>active(o)&&Math.abs(o.velocity??o.speed)<.15&&sweptOverlaps(probe.pose,end,v.kind,o.pose,o.kind,.06)));
+      return {v,steering,free,progress,keepsBuffer,score:progress-alignment*.5-Math.abs(probe.offset)*.2};
+    }).filter(c=>c.keepsBuffer&&c.free>=.8&&c.progress>.25).sort((a,b)=>b.score-a.score);
   }
 
   private reverseChoices(v:Vehicle,near:Vehicle[],sim:Simulation,max:number){
@@ -515,7 +512,7 @@ export class DrivingSystem {
       if(near.some(o=>o.id!==v.id&&this.reverse.has(o.id)&&dist(o.pose,v.pose)<12&&this.conflict(v,o,sim.time)))continue;
       const forward=this.forwardChoices(v,near,sim)[0];
       if(forward){this.forward.set(v.id,{steering:forward.steering,until:sim.time+4,start:v.s});this.grants.set(v.id,sim.time+8);continue;}
-      const bodyBlocker=near.some(o=>o!==v&&active(o)&&this.bodyBlocks(v,o,1));
+      const bodyBlocker=near.some(o=>o!==v&&active(o)&&(this.bodyBlocks(v,o,1)||v.yieldingTo?.includes(o.id)&&this.stoppedPathObstruction(v,o)!==undefined));
       if(!bodyBlocker||!this.safeMotion(v,this.motion(v,.1,v.targetOffset,1/30),[],sim)){
         const choice=this.reverseChoices(v,near,sim,4)[0];
         if(choice){
@@ -541,6 +538,13 @@ export class DrivingSystem {
       const near=neighbors.get(v.id)??[],intent=intents.get(v.id)!;
       const blockers=near.filter(o=>o!==v&&active(o)&&o.speed<.3&&this.bodyBlocks(v,o));
       const ids=blockers.map(o=>o.id);if(intent.other!==undefined&&!ids.includes(intent.other))ids.push(intent.other);
+      // Forecast conflicts can be several seconds away. Only present physical
+      // dependencies belong in a recovery cycle; a distant follower must not be
+      // selected to reverse merely because it appears in another car's forecast.
+      for(const id of intent.yieldingTo??v.yieldingTo??[]){
+        const other=near.find(o=>o.id===id);
+        if(other&&other.speed<.3&&this.bodyBlocks(v,other,1)&&!ids.includes(id))ids.push(id);
+      }
       const need=this.reverseNeeds.get(v.id);
       if(need){
         const other=near.find(o=>o.id===need.other);
@@ -572,7 +576,7 @@ export class DrivingSystem {
         ||[...this.reverse.values()].some(plan=>plan.group?.some(id=>cycle.includes(id))))continue;
       const bodiesLocked=cycle.some(id=>{
         const a=sim.vehicles.find(v=>v.id===id)!;
-        return (neighbors.get(id)??[]).some(b=>b!==a&&cycle.includes(b.id)&&this.bodyBlocks(a,b));
+        return (neighbors.get(id)??[]).some(b=>b!==a&&cycle.includes(b.id)&&(this.bodyBlocks(a,b)||this.stoppedPathObstruction(a,b)!==undefined));
       });
       const capacityCycle=cycle.every(id=>['following','exit-blocked'].includes(intents.get(id)!.state));
       if(!bodiesLocked&&!capacityCycle){
@@ -586,12 +590,19 @@ export class DrivingSystem {
           if(leader===undefined||!cycle.includes(leader))break;
           winner=sim.vehicles.find(v=>v.id===leader)!;
         }
-        this.grants.set(winner.id,sim.time+8);continue;
+        this.grants.set(winner.id,sim.time+8);
+        const advance=this.forwardChoices(winner,neighbors.get(winner.id)??[],sim)[0];
+        if(advance){
+          this.release.delete(winner.id);
+          this.forward.set(winner.id,{steering:advance.steering,until:sim.time+4,start:winner.s});
+        }
+        continue;
       }
       const forward=cycle.filter(id=>!intents.get(id)!.leader&&!['following','exit-blocked'].includes(intents.get(id)!.state)).flatMap(id=>{
         const v=sim.vehicles.find(v=>v.id===id)!;return this.forwardChoices(v,neighbors.get(id)??[],sim);
       }).sort((a,b)=>b.score-a.score)[0];
       if(forward){
+        this.release.delete(forward.v.id);
         this.grants.set(forward.v.id,sim.time+8);
         this.forward.set(forward.v.id,{steering:forward.steering,until:sim.time+4,start:forward.v.s});continue;
       }
@@ -624,6 +635,7 @@ export class DrivingSystem {
       candidates.sort((a,b)=>b.score-a.score||(b.v.approachSince??0)-(a.v.approachSince??0));
       const chosen=candidates[0];if(!chosen)continue;
       const other=parents.get(chosen.v.id)??edges.get(chosen.v.id)?.find(id=>cycle.includes(id));if(other===undefined)continue;
+      this.release.delete(chosen.v.id);
       this.reverse.set(chosen.v.id,{other,target:Math.max(0,chosen.v.s-Math.min(4,chosen.room)),start:chosen.v.s,until:sim.time+8,steering:chosen.steering,group:cycle});
       this.grants.delete(chosen.v.id);this.grants.set(other,sim.time+8);
 
@@ -643,7 +655,8 @@ export class DrivingSystem {
       v.inGarage=false;v.garageYield=undefined;v.pose=v.route.at(0);v.speed=0;v.velocity=0;v.steering=0;vehicles.push(v);insert(v);
     }
     sim.refreshObservations();
-    const neighbors=new Map<number,Vehicle[]>(),intents=new Map<number,Intent>();
+    this.reserveRetreats(vehicles);
+    const neighbors=new Map<number,Vehicle[]>(),intents=new Map<number,Intent>(),constraints=new Map<number,Intent>();
     for(const v of vehicles){
       v.age+=dt;v.decision-=dt;
       const x=Math.floor(v.pose.x/12),z=Math.floor(v.pose.z/12),near:Vehicle[]=[];
@@ -658,6 +671,11 @@ export class DrivingSystem {
       if(movement){if(v.approachId!==movement.id){v.approachId=movement.id;v.approachSince=sim.time;v.stopTime=0;v.stopSince=undefined;}}
       else{v.approachId=undefined;if(v.route.movements.length)v.approachSince=undefined;else v.approachSince??=sim.time;}
       const intent:Intent={target:spec.speed*(v.driverFactor??1),limit:v.route.total,state:'driving',reason:'Đường thông thoáng',movement,legal:false};
+      // Never choose a cruise speed whose stopping distance exceeds sensor range.
+      const sight=sim.observationProfiles[v.kind].front;
+      const visible=Math.max(0,(sight.angle>0&&sight.verticalAngle>0?sight.range:0)-spec.length/2-.5);
+      const reaction=.35;
+      intent.target=Math.min(intent.target,Math.sqrt((spec.brake*reaction)**2+2*spec.brake*visible)-spec.brake*reaction);
       // Preview curvature and decelerate before the bend, with distinct truck dynamics.
       const preview=v.speed*v.speed/(2*spec.brake)+8;
       for(let d=0;d<=preview;d+=2){const k=Math.abs(v.route.curvature(v.s+d)),curveSpeed=Math.sqrt(spec.lateralAccel/Math.max(.003,k));intent.target=Math.min(intent.target,Math.sqrt(curveSpeed**2+2*spec.brake*Math.max(0,d-2)));}
@@ -667,8 +685,13 @@ export class DrivingSystem {
         if(v.speed<.1&&Math.abs(movement.stop-v.s-spec.length/2)<1){v.stopTime=(v.stopTime??0)+dt;v.stopSince??=sim.time;}
         if((v.stopTime??0)<1)this.stop(intent,v,movement.stop-spec.length/2,'stopping','Dừng đủ một giây trước giao lộ');
       }
+      constraints.set(v.id,{...intent});
       const release=this.release.get(v.id);
-      if(release){const other=vehicles.find(o=>o.id===release.other);if(!other||sim.time>release.until||this.frontObstruction(v,other,2.5)===undefined)this.release.delete(v.id);else this.stop(intent,v,v.s,'yielding',`Chờ xe #${other.id} thoát điểm kẹt`,other.id);}
+      if(release){
+        const other=vehicles.find(o=>o.id===release.other);
+        if(!other||this.frontObstruction(v,other,6)===undefined)this.release.delete(v.id);
+        else this.stop(intent,v,v.s,'yielding',`Chờ xe #${other.id} thoát điểm kẹt`,other.id);
+      }
       intents.set(v.id,intent);
     }
     // All decisions read the same snapshot. Physical commits below are swept
@@ -745,14 +768,15 @@ export class DrivingSystem {
       }
       const m=intent.movement;
       if(m&&!m.circulating&&v.s<m.entry-spec.length/2){
-        const exit=v.route.at(Math.min(v.route.total,m.exit+spec.length/2+1),v.offset);
+        const exit=v.route.at(Math.min(v.route.total,m.exit+spec.length/2+1),v.targetOffset);
+        const tail=v.route.at(m.exit,v.targetOffset);
         const blocker=near.find(o=>{
           if(o===v||!active(o)||o.speed>=1||Math.cos(o.pose.angle-exit.angle)<.8)return false;
           const approach=o.route.movements.find(other=>other.id===m.id&&o.s<=other.entry+.5);
           // A car waiting on another approach of this junction is a priority
           // conflict, not a downstream queue occupying the receiving lane.
           if(approach)return false;
-          return overlaps(exit,v.kind,o.pose,o.kind,.35);
+          return sweptOverlaps(tail,exit,v.kind,o.pose,o.kind,.35);
         });
         if(blocker)this.stop(intent,v,m.stop-spec.length/2-.5,'exit-blocked','Phía ra giao lộ chưa đủ chỗ',blocker.id);
       }
@@ -775,17 +799,6 @@ export class DrivingSystem {
       const doorway=vehicles.find(o=>active(o)&&o.garageYield===v.id&&this.frontObstruction(v,o)!==undefined);
       if(doorway){const gap=this.frontObstruction(v,doorway)!;this.stop(intent,v,v.s+Math.max(0,gap-.5),'yielding','Chờ xe trước mặt lùi vào cửa nhà',doorway.id);}
     }
-    // Check the launch corridor before physical lock detection so a mutual
-    // obstruction still participates in the existing recovery solver.
-    for(const v of vehicles){
-      if(this.reverse.has(v.id)||v.garageYield!==undefined)continue;
-      const blocker=this.restartBlocker(v,neighbors.get(v.id)!,sim);
-      if(blocker){
-        const intent=intents.get(v.id)!;
-        if(intent.state!=='blocked')this.stop(intent,v,v.s,'yielding',`Chờ vùng phía trước an toàn trước khi khởi hành — xe #${blocker.id}`,blocker.id);
-        intent.target=0;
-      }
-    }
     // Detect geometric locks separately from normal following or right-of-way.
     for(const v of vehicles){const intent=intents.get(v.id)!,near=neighbors.get(v.id)!;
       const touching=near.find(o=>o!==v&&active(o)&&overlaps(v.route.at(v.s+.3,v.offset),v.kind,o.pose,o.kind,.12));
@@ -794,15 +807,86 @@ export class DrivingSystem {
       if(touching&&intent.state==='yielding'&&intents.get(touching.id)?.other===v.id&&Math.cos(v.pose.angle-touching.pose.angle)<.8){intent.state='blocked';intent.legal=false;}
     }
     if(this.tick%15===0)this.recover(sim,intents,neighbors);
-    this.reserved.clear();
-    for(const [id,plan] of this.reverse){
-      const owner=vehicles.find(v=>v.id===id);if(!owner)continue;
-      const remaining=Math.max(0,Math.min(4,plan.start-plan.target)-(plan.travelled??0)),poses:Pose[]=[];
-      for(let d=.2;d<=remaining+.001;d+=.2)poses.push(driveArc(owner.pose,-d,plan.steering??owner.steering??0,SPECS[owner.kind].wheelbase));
-      this.reserved.set(id,{kind:owner.kind,poses});
+    // Safety prediction reads one shared snapshot and is independent of right
+    // of way. Recovery grants and following/traffic-rule branches cannot skip it.
+    const prediction=new YieldPrediction(),byId=new Map(vehicles.map(v=>[v.id,v]));
+    for(const v of vehicles){
+      const intent=intents.get(v.id)!;intent.yieldingTo??=[];
+      if(this.reverse.has(v.id)||v.garageYield!==undefined)continue;
+      const recovery=this.forward.get(v.id),base=constraints.get(v.id)!;
+      if(recovery&&recovery.until>sim.time&&base.state==='driving'&&intent.state!=='exit-blocked'&&!this.release.has(v.id)){
+        // A validated recovery arc replaces the stale geometric yield that
+        // caused the lock. Signals, exit capacity and collision prediction still
+        // constrain this short, low-speed movement on every integration step.
+        intent.target=Math.min(base.target,.8);intent.limit=Math.min(base.limit,recovery.start+1.2);
+        intent.state='driving';intent.reason='Tiến chậm để mở khoảng trống';intent.legal=false;
+        intent.other=undefined;intent.leader=undefined;
+      }
+      const seen=sim.observations.get(v.id);
+      const ids=new Set([...(seen?.front??[]),...(seen?.rear??[])].map(o=>o.id));
+      const observed=[...ids].flatMap(id=>{const other=byId.get(id);return other?[other]:[];});
+      let plan=prediction.plan(v,observed,intent.target,intent.limit,this.forward.get(v.id)?.steering);
+      const cached=this.avoidance.get(v.id);
+      const blocked=!!plan||intent.state==='blocked'||intent.state==='following'&&observed.some(o=>this.stoppedPathObstruction(v,o)!==undefined);
+      const stationaryObstruction=observed.some(o=>Math.abs(o.velocity??o.speed)<.3
+        &&this.stoppedPathObstruction(v,o)!==undefined);
+      const canDetour=base.state==='driving'&&!intent.line&&!['red-light','stopping','exit-blocked'].includes(intent.state)
+        &&stationaryObstruction&&!this.forward.has(v.id)&&!this.release.has(v.id);
+      if(blocked&&canDetour&&(!cached||cached.steering!==undefined||sim.time>=cached.retryAt)){
+        const detour=prediction.steerAround(v,observed,base.target,base.limit,
+          (from,to)=>this.safeMotion(from,to,neighbors.get(v.id)!,sim,base.line),
+          cached&&sim.time<cached.retryAt?cached.steering:undefined,
+          cached&&sim.time<cached.retryAt?cached.targetOffset:undefined,
+          cached&&sim.time<cached.retryAt?Math.max(0,(cached.until??sim.time)-sim.time):.6);
+        if(detour){
+          this.avoidance.set(v.id,{steering:detour.steering,targetOffset:detour.targetOffset,until:sim.time+detour.duration,retryAt:sim.time+.35});
+          intent.target=detour.target;intent.limit=base.limit;intent.travelLimit=undefined;
+          intent.avoidanceSteering=detour.duration>0?detour.steering:undefined;intent.avoidanceOffset=detour.targetOffset;intent.state='driving';intent.legal=false;
+          intent.reason='Đánh lái qua khoảng trống an toàn';intent.other=undefined;intent.leader=undefined;intent.yieldingTo=[];
+          plan=undefined; // The complete steering-and-offset path was validated above.
+        }else this.avoidance.set(v.id,{retryAt:cached?.steering!==undefined?sim.time:sim.time+.35});
+      }else if(!blocked||!canDetour)this.avoidance.delete(v.id);
+      if(!plan)continue;
+      intent.yieldingTo=[...new Set([...intent.yieldingTo,...plan.risks.map(r=>r.id)])].sort((a,b)=>a-b);
+      const first=[...plan.risks].sort((a,b)=>a.distance-b.distance||a.time-b.time||a.id-b.id)[0];
+      const reason=`${plan.emergency?'Phanh tránh va chạm':'Nhường trước vùng xung đột'} với xe ${intent.yieldingTo.map(id=>`#${id}`).join(', ')}`;
+      const state=['red-light','stopping','exit-blocked','blocked'].includes(intent.state)?intent.state:'yielding';
+      const previousTarget=intent.target;
+      this.stop(intent,v,plan.limit,state,reason,first.id);
+      if(plan.target<previousTarget&&['driving','following'].includes(intent.state)){
+        intent.state='yielding';intent.reason=reason;intent.other=first.id;intent.legal=true;
+      }
+      intent.target=Math.min(intent.target,plan.target);
+      intent.travelLimit=plan.distance;
     }
+    this.reserveRetreats(vehicles);
+    // A new recovery plan takes effect this tick. Its beneficiary waits for the
+    // retreat to finish instead of following the reversing nose into its space.
+    for(const [owner,reverse] of this.reverse){
+      const other=byId.get(reverse.other),retreat=byId.get(owner);
+      if(!other||!retreat||other.id===owner||this.reverse.has(other.id))continue;
+      if(dist(other.pose,retreat.pose)>12)continue;
+      const intent=intents.get(other.id)!;
+      this.stop(intent,other,other.s,'yielding',`Chờ xe #${owner} lùi mở khoảng trống`,owner);
+      intent.avoidanceSteering=undefined;intent.avoidanceOffset=undefined;
+    }
+    const committed=new Map<number,{from:Pose;to:Pose}>();
     for(const v of vehicles){
       const intent=intents.get(v.id)!,near=neighbors.get(v.id)!,spec=SPECS[v.kind],oldS=v.s,oldSpeed=v.speed,oldCell=cell(v.pose);
+      const startPose=v.pose;
+      const canCommit=(next:ReturnType<DrivingSystem['motion']>,manoeuvring:boolean)=>{
+        if(!this.safeMotion(v,next,near,sim,intent.line,manoeuvring))return false;
+        for(const other of near){
+          if(other.id===v.id)continue;
+          const motion=committed.get(other.id);if(!motion)continue;
+          if(movingBodiesOverlap(startPose,next.pose,v.kind,motion.from,motion.to,other.kind,.06)){
+            // Existing, stationary contacts may separate during a recovery.
+            if(!(manoeuvring&&dist(motion.from,motion.to)<1e-10&&Math.abs(angle(motion.to.angle-motion.from.angle))<1e-10
+              &&separatesContact(startPose,next.pose,v.kind,motion.from,other.kind)))return false;
+          }
+        }
+        return true;
+      };
       let forward=this.forward.get(v.id);
       if(forward&&(sim.time>forward.until||v.s-forward.start>1.2)){this.forward.delete(v.id);forward=undefined;}
       let distance=0,reverse=this.reverse.get(v.id),reverseTarget=reverse?.other===v.id?0:v.offset;
@@ -823,39 +907,50 @@ export class DrivingSystem {
       }else{
         const requested=clamp((intent.target-oldSpeed)/dt,-spec.emergencyBrake,spec.accel);
         v.acceleration=requested;v.speed=Math.max(0,oldSpeed+requested*dt);
-        distance=Math.min(v.speed*dt,Math.max(0,intent.limit-v.s));
+        distance=Math.min(v.speed*dt,Math.max(0,intent.limit-v.s),intent.travelLimit??Infinity);
       }
       if(forward&&!reverse&&v.garageYield===undefined&&Math.abs((v.steering??0)-forward.steering)>.025){
         v.steering=(v.steering??0)+clamp(forward.steering-(v.steering??0),-dt*1.3,dt*1.3);distance=0;v.speed=0;
         if(!intent.legal)intent.reason='Đánh lái để đi tiếp qua khoảng trống';
       }
+      if(intent.avoidanceOffset!==undefined)v.targetOffset=intent.avoidanceOffset;
       const target=distance<0?reverseTarget:v.targetOffset;
-      let next=this.motion(v,distance,target,dt,reverse?.steering??forward?.steering);
+      let next=this.motion(v,distance,target,dt,reverse?.steering??intent.avoidanceSteering??forward?.steering);
       // A stop line is a geometric constraint for every movement, including
       // avoidance and recovery. Collision prevention cannot override a red.
-      if(distance>0&&next.s>intent.limit+.001){distance*=Math.max(0,(intent.limit-v.s)/(next.s-v.s));next=this.motion(v,distance,target,dt);}
+      if(distance>0&&next.s>intent.limit+.001){distance*=Math.max(0,(intent.limit-v.s)/(next.s-v.s));next=this.motion(v,distance,target,dt,reverse?.steering??intent.avoidanceSteering??forward?.steering);}
       if(distance>0&&intent.line&&this.frontAtLine(next.pose,v,intent.line)>0){
         let low=0,high=distance;
         for(let i=0;i<14;i++){
-          const mid=(low+high)/2,candidate=this.motion(v,mid,target,dt,reverse?.steering??forward?.steering);
+          const mid=(low+high)/2,candidate=this.motion(v,mid,target,dt,reverse?.steering??intent.avoidanceSteering??forward?.steering);
           if(this.frontAtLine(candidate.pose,v,intent.line)>0)high=mid;else low=mid;
         }
-        distance=low;next=this.motion(v,distance,target,dt,reverse?.steering??forward?.steering);
+        distance=low;next=this.motion(v,distance,target,dt,reverse?.steering??intent.avoidanceSteering??forward?.steering);
       }
-      let moved=this.safeMotion(v,next,near,sim,intent.line,!!reverse||!!forward);
-      if(!moved&&distance>0){
+      let avoidanceTargets:Vehicle[]|undefined;
+      let fallbackPrediction:YieldPrediction|undefined;
+      const targets=()=>{
+        if(avoidanceTargets)return avoidanceTargets;
+        const seen=sim.observations.get(v.id),ids=new Set([...(seen?.front??[]),...(seen?.rear??[])].map(o=>o.id));
+        return avoidanceTargets=near.filter(o=>ids.has(o.id));
+      };
+      let moved=canCommit(next,!!reverse||!!forward);
+      if(!moved&&distance>0&&intent.avoidanceOffset===undefined){
         // Try small forward arcs only. Never translate sideways at zero speed.
         for(const offset of [v.offset,v.targetOffset-.5,v.targetOffset+.5]){
           const bound=Math.max(0,(v.route.at(v.s).width-spec.width)/2-.25);
-          const candidate=this.motion(v,distance,clamp(offset,-bound,bound),dt);
-          if(candidate.s<=intent.limit+.001&&this.safeMotion(v,candidate,near,sim,intent.line,!!reverse||!!forward)){next=candidate;moved=true;break;}
+          const candidateOffset=clamp(offset,-bound,bound);
+          if((fallbackPrediction??=new YieldPrediction()).plan({...v,targetOffset:candidateOffset},targets(),Math.max(v.speed,intent.target),intent.limit))continue;
+          const candidate=this.motion(v,distance,candidateOffset,dt);
+          if(candidate.s<=intent.limit+.001&&canCommit(candidate,!!reverse||!!forward)){next=candidate;moved=true;break;}
         }
       }
-      if(!moved&&distance>0&&!intent.legal){
+      if(!moved&&distance>0&&!intent.legal&&intent.avoidanceOffset===undefined){
         let best=-Infinity;
         for(const steering of [-spec.maxSteer,-spec.maxSteer/2,0,spec.maxSteer/2,spec.maxSteer]){
+          if((fallbackPrediction??=new YieldPrediction()).plan(v,targets(),Math.max(v.speed,intent.target),intent.limit,steering))continue;
           const candidate=this.motion(v,distance,target,dt,steering);
-          if(candidate.s>intent.limit+.001||!this.safeMotion(v,candidate,near,sim,intent.line,!!reverse||!!forward))continue;
+          if(candidate.s>intent.limit+.001||!canCommit(candidate,!!reverse||!!forward))continue;
           const future=this.motion({...v,...candidate},.6,target,.6,steering);
           if(!this.safeMotion({...v,...candidate},future,near,sim,intent.line,!!reverse||!!forward))continue;
           const score=future.s-v.s-Math.abs(future.offset)*.15-Math.abs(angle(future.pose.angle-v.route.at(future.s).angle))*.2;
@@ -864,6 +959,7 @@ export class DrivingSystem {
       }
       if(moved){v.pose=next.pose;v.s=next.s;v.offset=next.offset;v.steering=next.steering;}
       else{v.steering=next.steering;v.speed=0;v.acceleration=-oldSpeed/dt;if(!intent.legal&&intent.state!=='reversing'){intent.state='blocked';intent.reason='Chờ khoảng trống cho cả thân xe';}}
+      committed.set(v.id,{from:startPose,to:v.pose});
       if(moved&&reverse)reverse.travelled=(reverse.travelled??0)+Math.abs(distance);
       v.velocity=moved?distance/dt:0;
       v.acceleration=(v.speed-oldSpeed)/dt;
@@ -881,7 +977,7 @@ export class DrivingSystem {
       v.blocked=intent.state==='blocked'&&Math.abs(v.velocity)<.15;
       v.stuckTime=v.blocked?(v.stuckTime??0)+dt:0;
       v.waiting=Math.abs(v.velocity)<.15?v.waiting+dt:Math.max(0,v.waiting-dt*2);
-      v.state=intent.state;v.reason=intent.reason;v.blockerId=intent.other;
+      v.state=intent.state;v.reason=intent.reason;v.blockerId=intent.other;v.yieldingTo=intent.yieldingTo??[];
       const m=intent.movement,driveway=v.s<v.route.departureLength+8||v.s>v.route.total-v.route.arrivalLength-8,turn=m?.turn??(driveway||!v.route.movements.length?v.route.upcomingTurn(v.s,12)?.direction??0:0);
       const changing=v.targetOffset-v.offset;
       v.indicator=-(Math.abs(changing)>.5?Math.sign(changing):turn) as -1|0|1;
@@ -894,11 +990,13 @@ export class DrivingSystem {
       v.motionState=vehicleMotionState(v);
       // Replan a sustained blocked trip from a real road position. The new
       // route starts at the exact pose, so neither position nor heading teleports.
-      if(((v.stuckTime??0)>20||v.waiting>25&&['following','exit-blocked'].includes(v.state??''))&&sim.time>(v.rerouteAt??0)&&v.route.toHouse!==undefined&&v.leftHouse){
-        v.rerouteAt=sim.time+25;this.reroute(v,sim);
+      const congested=(v.stuckTime??0)>20||v.waiting>25&&['following','exit-blocked'].includes(v.state??'');
+      const reviewRoute=this.tick%60===v.id%60&&v.age>12&&!this.reverse.has(v.id)&&!this.release.has(v.id);
+      if((congested||reviewRoute)&&sim.time>(v.rerouteAt??0)&&v.route.toHouse!==undefined&&v.leftHouse){
+        v.rerouteAt=sim.time+15+v.id%7;this.reroute(v,sim);
       }
     }
-    if(this.tick%300===0){const ids=new Set(sim.vehicles.filter(v=>!v.arrived).map(v=>v.id));for(const k of this.conflicts.keys()){if(k.split(':').some(id=>!ids.has(Number(id)))){this.conflicts.delete(k);this.conflictExpiry.delete(k);}}for(const map of [this.reverse,this.reserved,this.reverseNeeds,this.reverseCooldown,this.forward,this.release,this.grants])for(const id of map.keys())if(!ids.has(id))map.delete(id);}
+    if(this.tick%300===0){const ids=new Set(sim.vehicles.filter(v=>!v.arrived).map(v=>v.id));for(const k of this.conflicts.keys()){if((this.conflictExpiry.get(k)??0)<sim.time||k.split(':').some(id=>!ids.has(Number(id)))){this.conflicts.delete(k);this.conflictExpiry.delete(k);}}for(const map of [this.reverse,this.reserved,this.reverseNeeds,this.reverseCooldown,this.forward,this.release,this.grants,this.avoidance])for(const id of map.keys())if(!ids.has(id))map.delete(id);}
   }
 
   private reroute(v:Vehicle,sim:Simulation){
@@ -911,12 +1009,12 @@ export class DrivingSystem {
 
     const delays=this.roadDelay(sim);
     const from={id:-v.id,x:v.pose.x,z:v.pose.z,angle:v.pose.angle,kind:0};
-    const route=planRoute(sim.world,from,destination,{kind:v.kind,roadDelay:delays,startPose:v.pose});if(!route)return;
+    const route=planRoute(sim.world,from,destination,{kind:v.kind,roadDelay:delays,startPose:v.pose,travelTime:true});if(!route)return;
     const remaining=new Set<number>();
     for(let s=v.s;s<v.route.total-v.route.arrivalLength;s+=8){const road=sim.world.nearest(v.route.at(s))?.road;if(road)remaining.add(road.id);}
-    const oldCost=v.route.total-v.s+[...remaining].reduce((n,id)=>n+(delays.get(id)??0),0);
-    const newCost=route.total+route.roadIds.reduce((n,id)=>n+(delays.get(id)??0),0);
-    if(newCost>=oldCost-5)return;
+    const oldCost=(v.route.total-v.s)/SPECS[v.kind].speed+[...remaining].reduce((n,id)=>n+(delays.get(id)??0),0);
+    const newCost=route.total/SPECS[v.kind].speed+route.roadIds.reduce((n,id)=>n+(delays.get(id)??0),0);
+    if(oldCost-newCost<Math.max(3,oldCost*.15))return;
     v.route=route;this.reverse.delete(v.id);this.reserved.delete(v.id);this.reverseNeeds.delete(v.id);this.forward.delete(v.id);this.release.delete(v.id);
     for(const k of this.conflicts.keys())if(k.split(':').includes(String(v.id))){this.conflicts.delete(k);this.conflictExpiry.delete(k);}
     v.s=0;v.offset=v.targetOffset=0;v.approachId=undefined;

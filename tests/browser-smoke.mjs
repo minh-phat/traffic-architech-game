@@ -43,7 +43,13 @@ try {
   await chooseVehicle();await page.check('#show-directions');
   await page.waitForFunction(()=>{const s=window.__PHO_FLOW__.snapshot();return s.selectedVehicleId===null&&s.directionVehicleIds.length===s.vehicles;});
   await page.uncheck('#show-directions');await chooseVehicle();
-  await page.mouse.click(map.x+map.width/2-100*map.height/190,map.y+map.height/2+72*map.height/190);
+  // Floating traffic panels can cover the old fixed map coordinate. Click an
+  // actual empty canvas point so the test exercises map deselection.
+  const emptyPoints=[[-100,72],[100,72],[-100,-72],[100,-72]].map(([x,z])=>({x:map.x+map.width/2+x*map.height/190,y:map.y+map.height/2+z*map.height/190}));
+  let emptyPoint;
+  for(const point of emptyPoints)if(await page.evaluate(({x,y})=>document.elementFromPoint(x,y)?.id==='city-canvas',point)){emptyPoint=point;break;}
+  assert.ok(emptyPoint,'An empty map point must be outside floating panels');
+  await page.mouse.click(emptyPoint.x,emptyPoint.y);
   assert.equal((await page.evaluate(()=>window.__PHO_FLOW__.snapshot())).selectedVehicleId,null);
   await page.click('#camera-home');
   await page.check('#debug');await page.click('#day-night');await page.screenshot({path:'test-results/night.png'});await page.click('#day-night');
